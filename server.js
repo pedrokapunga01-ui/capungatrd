@@ -94,20 +94,35 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS trade_sinais (
       id BIGSERIAL PRIMARY KEY,
       symbol TEXT NOT NULL,
-      direcao TEXT NOT NULL CHECK (direcao IN ('COMPRA','VENDA')),
+      direcao TEXT NOT NULL,
       preco_entrada NUMERIC NOT NULL,
-      score INTEGER NOT NULL,
+      score INTEGER DEFAULT 0,
       setup TEXT,
-      estado TEXT NOT NULL DEFAULT 'PENDENTE'
-        CHECK (estado IN ('PENDENTE','GREEN','G1','LOSS','EXPIRADO')),
-      gale SMALLINT NOT NULL DEFAULT 0 CHECK (gale BETWEEN 0 AND 1),
+      estado TEXT NOT NULL DEFAULT 'PENDENTE',
+      gale SMALLINT NOT NULL DEFAULT 0,
       preco_saida NUMERIC,
       pnl_pct NUMERIC,
       criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       resolvido_em TIMESTAMPTZ
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ts_estado ON trade_sinais (estado, id DESC);`);
+  // Migração da v1 (confluencia) → v2 (score)
+  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS score INTEGER DEFAULT 0`);
+  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS setup TEXT`);
+  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_saida NUMERIC`);
+  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC`);
+  // Se existir coluna antiga confluencia, copia valores
+  await pool.query(`
+    DO $$ BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='trade_sinais' AND column_name='confluencia'
+      ) THEN
+        UPDATE trade_sinais SET score = COALESCE(score, confluencia, 0) WHERE score IS NULL OR score = 0;
+      END IF;
+    END $$;
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ts_estado ON trade_sinais (estado, id DESC)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trade_eventos (
