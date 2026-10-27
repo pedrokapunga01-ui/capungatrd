@@ -422,12 +422,12 @@ function analisarConfluencia(candles1m, candles5m) {
   let scoreVenda = 0;
   const fatores = [];
 
-  // 1. Alinhamento de EMAs (peso alto)
+  // 1. Alinhamento de EMAs
   if (e9 > e21 && e21 > e50) {
-    scoreCompra += 22;
+    scoreCompra += 20;
     fatores.push('EMA alinhada ALTA');
   } else if (e9 < e21 && e21 < e50) {
-    scoreVenda += 22;
+    scoreVenda += 20;
     fatores.push('EMA alinhada BAIXA');
   } else if (e9 > e21) {
     scoreCompra += 10;
@@ -437,11 +437,17 @@ function analisarConfluencia(candles1m, candles5m) {
     fatores.push('EMA9<EMA21');
   }
 
-  // 2. RSI
-  if (r < 32) {
+  // 2. RSI — peso maior em extremos (mean-reversion)
+  if (r < 28) {
+    scoreCompra += 26;
+    fatores.push(`RSI extremo oversold ${r.toFixed(1)}`);
+  } else if (r < 35) {
     scoreCompra += 18;
     fatores.push(`RSI oversold ${r.toFixed(1)}`);
-  } else if (r > 68) {
+  } else if (r > 72) {
+    scoreVenda += 26;
+    fatores.push(`RSI extremo overbought ${r.toFixed(1)}`);
+  } else if (r > 65) {
     scoreVenda += 18;
     fatores.push(`RSI overbought ${r.toFixed(1)}`);
   } else if (r < 45) {
@@ -452,19 +458,19 @@ function analisarConfluencia(candles1m, candles5m) {
 
   // 3. MACD histograma (momentum)
   if (h > 0 && h > hPrev) {
-    scoreCompra += 16;
+    scoreCompra += 14;
     fatores.push('MACD hist expansivo +');
   } else if (h < 0 && h < hPrev) {
-    scoreVenda += 16;
+    scoreVenda += 14;
     fatores.push('MACD hist expansivo -');
   } else if (h > 0) {
-    scoreCompra += 7;
+    scoreCompra += 6;
   } else {
-    scoreVenda += 7;
+    scoreVenda += 6;
   }
 
   // 4. Volume acima da média
-  if (vol > volMed * 1.35) {
+  if (vol > volMed * 1.25) {
     if (price > candles1m[i - 1].close) {
       scoreCompra += 12;
       fatores.push('Volume alto + candle verde');
@@ -474,37 +480,47 @@ function analisarConfluencia(candles1m, candles5m) {
     }
   }
 
-  // 5. Tendência 5m (filtro de regime)
+  // 5. Tendência 5m (peso moderado — permite reversão)
   if (trend5 === 'ALTA') {
-    scoreCompra += 14;
+    scoreCompra += 10;
     fatores.push('Tendência 5m ALTA');
   } else if (trend5 === 'BAIXA') {
-    scoreVenda += 14;
+    scoreVenda += 10;
     fatores.push('Tendência 5m BAIXA');
   }
 
-  // 6. Volatilidade (ATR) — evita mercados mortos
+  // 6. Volatilidade (ATR) — penalidade suave
   const atrPct = (a / price) * 100;
-  if (atrPct < 0.04) {
-    // mercado muito calmo → reduz confiança
-    scoreCompra = Math.floor(scoreCompra * 0.7);
-    scoreVenda = Math.floor(scoreVenda * 0.7);
+  if (atrPct < 0.025) {
+    scoreCompra = Math.floor(scoreCompra * 0.88);
+    scoreVenda = Math.floor(scoreVenda * 0.88);
     fatores.push('ATR baixo (mercado calmo)');
   }
 
-  // 7. Preço vs EMA50 (posição estrutural)
-  if (price > e50) scoreCompra += 8;
-  else scoreVenda += 8;
+  // 7. Preço vs EMA50
+  if (price > e50) scoreCompra += 6;
+  else scoreVenda += 6;
+
+  // 8. Bónus mean-reversion: RSI extremo contra a tendência
+  if (r < 30 && trend5 === 'BAIXA') {
+    scoreCompra += 12;
+    fatores.push('Reversão: RSI oversold em tendência baixa');
+  }
+  if (r > 70 && trend5 === 'ALTA') {
+    scoreVenda += 12;
+    fatores.push('Reversão: RSI overbought em tendência alta');
+  }
 
   scoreCompra = clamp(scoreCompra, 0, 100);
   scoreVenda = clamp(scoreVenda, 0, 100);
 
   let direcao = null;
   let score = 0;
-  if (scoreCompra >= MIN_CONFLUENCIA && scoreCompra > scoreVenda + 8) {
+  const margem = 5;
+  if (scoreCompra >= MIN_CONFLUENCIA && scoreCompra >= scoreVenda + margem) {
     direcao = 'COMPRA';
     score = scoreCompra;
-  } else if (scoreVenda >= MIN_CONFLUENCIA && scoreVenda > scoreCompra + 8) {
+  } else if (scoreVenda >= MIN_CONFLUENCIA && scoreVenda >= scoreCompra + margem) {
     direcao = 'VENDA';
     score = scoreVenda;
   }
@@ -513,6 +529,8 @@ function analisarConfluencia(candles1m, candles5m) {
     ok: Boolean(direcao),
     direcao,
     score,
+    scoreCompra,
+    scoreVenda,
     price,
     atr: a,
     atrPct: Number(atrPct.toFixed(4)),
@@ -724,7 +742,7 @@ async function ciclo() {
     if (analise.ok) {
       await criarSinal(analise);
     } else {
-      console.log(`[ANALISE] ${analise.motivo} | scoreC/V não atingiu ${MIN_CONFLUENCIA}`);
+      console.log(`[ANALISE] ${analise.motivo} | C=${analise.scoreCompra} V=${analise.scoreVenda} (min ${MIN_CONFLUENCIA})`);
     }
 
     lastError = null;
