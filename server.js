@@ -1,1068 +1,459 @@
 'use strict';
-
-/**
- * CAPUNGA TRADE — BTC Signal Engine v3 (Bybit)
- *
- * - Dados da Bybit (BTCUSDT perp), fallback OKX
- * - Só usa velas FECHADAS (sem repaint)
- * - Só sinaliza com 5m + 15m alinhados com a direção + pullback + momentum
- * - TP/SL dinâmicos por ATR, resolvidos por high/low das velas (não perde picos)
- * - Gale máx. 1 (re-entrada real, com novo TP/SL)
- * - Sem sinais expirados: ao acordar, apura GREEN/LOSS pelo histórico de velas
- * - 100% automático: loop + keep-alive (Render free) + pausa após LOSS
- * - /backtest mede a taxa de acerto REAL da estratégia nos dados recentes
- *
- * Env obrigatórias: DATABASE_URL · BOT_TOKEN · CHAT_ID
- * Env opcionais:
- *   PORT · SYMBOL (BTCUSDT) · BYBIT_CATEGORY (linear)
- *   MIN_CONFLUENCIA (75) · LOOP_MS (20000)
- *   TP_ATR (1.0) · SL_ATR (2.0) · TP_MIN_PCT (0.10) · SL_MIN_PCT (0.20)
- *   SINAL_EXPIRA_MS (1200000, janela máx. antes de fechar por preço) · ANTI_SPAM_MS (180000) · LOSS_PAUSE_MS (900000)
- *   KEEPALIVE_URL (ou RENDER_EXTERNAL_URL automático no Render)
- *   TIMEZONE (Africa/Luanda) · DATABASE_SSL=false para desligar SSL
- */
-
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
-
 const app = express();
+app.disable('x-powered-by');
 app.use(cors());
-app.use(express.json({ limit: '256kb' }));
-
-// ── Config ──────────────────────────────────────────────────────────────────
-
-const envNum = (k, d) => {
-  const n = Number(process.env[k]);
-  return Number.isFinite(n) && process.env[k] !== '' && process.env[k] != null ? n : d;
-};
-
-const PORT = envNum('PORT', 3000);
-const DATABASE_URL = process.env.DATABASE_URL;
-const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
-const CHAT_ID = (process.env.CHAT_ID || '').trim();
-const SYMBOL = (process.env.SYMBOL || 'BTCUSDT').toUpperCase();
-const CATEGORY = process.env.BYBIT_CATEGORY || 'linear';
-
-const MIN_SCORE = Math.min(95, Math.max(55, envNum('MIN_CONFLUENCIA', 75)));
-const LOOP_MS = Math.max(15000, envNum('LOOP_MS', 20000));
-const SINAL_EXPIRA_MS = Math.max(300000, envNum('SINAL_EXPIRA_MS', 1200000));
-const ANTI_SPAM_MS = Math.max(60000, envNum('ANTI_SPAM_MS', 180000));
-const LOSS_PAUSE_MS = Math.max(0, envNum('LOSS_PAUSE_MS', 900000));
-const MAX_GALE = 1;
-const TIMEZONE = process.env.TIMEZONE || 'Africa/Luanda';
-
-const TP_ATR = envNum('TP_ATR', 1.0);
-const SL_ATR = envNum('SL_ATR', 2.0);
-const TP_MIN_PCT = envNum('TP_MIN_PCT', 0.10);
-const SL_MIN_PCT = envNum('SL_MIN_PCT', 0.20);
-const ATR_MIN_PCT = envNum('ATR_MIN_PCT', 0.02);
-const ATR_MAX_PCT = envNum('ATR_MAX_PCT', 0.6);
-
-const SELF_URL = (process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
-
-if (!DATABASE_URL) {
-  console.error('[FATAL] DATABASE_URL em falta');
-  process.exit(1);
+app.use(express.json({ limit: '32kb' }));
+function numEnv(name, fallback, min, max) {
+const n = Number(process.env[name] ?? fallback);
+return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 }
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-  max: 6,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 12000
+function round(n, places = 2) { const p = 10 ** places; return Math.round((Number(n) + Number.EPSILON) * p) / p; }
+function errText(e) { return String(e?.message || e || 'Unknown error').slice(0, 400); }
+const CFG = Object.freeze({
+port: numEnv('PORT', 3000, 1, 65535),
+symbol: String(process.env.SYMBOL || 'BTCUSDT').toUpperCase(),
+category: 'spot',
+bybitUrl: (process.env.BYBIT_BASE_URL || 'https://api.bybit.com').replace(/\/$/, ''),
+loopMs: numEnv('LOOP_MS', 60000, 15000, 3600000),
+minScore: numEnv('MIN_SCORE', 5, 3, 8),
+minRR: numEnv('MIN_RR', 1.4, 1, 5),
+riskPct: numEnv('RISK_PCT', 1, 0.1, 1) / 100,
+maxDeviationPct: numEnv('MAX_ENTRY_DEVIATION_PCT', 0.35, 0.05, 3) / 100,
+tpAtr: numEnv('ATR_TP_MULT', 1.8, 0.5, 10),
+slAtr: numEnv('ATR_SL_MULT', 1.2, 0.5, 10),
+tpMinPct: numEnv('TP_MIN_PCT', 0.25, 0.05, 5) / 100,
+slMinPct: numEnv('SL_MIN_PCT', 0.20, 0.05, 5) / 100,
+expiryMs: numEnv('SIGNAL_EXPIRY_MIN', 240, 15, 10080) * 60000,
+antiSpamMs: numEnv('ANTI_SPAM_MIN', 60, 1, 1440) * 60000,
+candleLimit: numEnv('CANDLE_LIMIT', 200, 100, 1000),
+apiKey: process.env.API_KEY || '',
+botToken: process.env.BOT_TOKEN || '',
+chatId: process.env.CHAT_ID || '',
+keepaliveUrl: process.env.KEEPALIVE_URL || '',
+databaseUrl: process.env.DATABASE_URL || '',
+databaseSsl: String(process.env.DATABASE_SSL || 'true').toLowerCase() !== 'false',
+telegramPollMs: numEnv('TELEGRAM_POLL_MS', 4000, 1500, 30000),
+allowTelegramCommands: String(process.env.TELEGRAM_COMMANDS || 'true').toLowerCase() !== 'false'
 });
-
-let busy = false;
-let lastSignalAt = 0;
-let lastLossAt = 0;
+const pool = CFG.databaseUrl ? new Pool({
+connectionString: CFG.databaseUrl,
+ssl: CFG.databaseSsl ? { rejectUnauthorized: false } : false,
+max: 8,
+idleTimeoutMillis: 30000,
+connectionTimeoutMillis: 10000
+}) : null;
+let server;
+let scanTimer;
+let keepaliveTimer;
+let telegramTimer;
+let scanning = false;
+let shuttingDown = false;
 let lastAnalysis = null;
 let lastError = null;
-let lastSource = null;
-let signalsSent = 0;
-let loopTimer = null;
-let keepTimer = null;
-
-// ── Utils ───────────────────────────────────────────────────────────────────
-
-const nowISO = () => new Date().toISOString();
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-const pos = (v, fb) => { const n = Number(v); return v != null && Number.isFinite(n) && n > 0 ? n : fb; };
-const num = (v, fb = 0) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fb;
-};
-const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-
-const TF = {
-  '1m': { bybit: '1', okx: '1m', ms: 60000 },
-  '5m': { bybit: '5', okx: '5m', ms: 300000 },
-  '15m': { bybit: '15', okx: '15m', ms: 900000 }
-};
-
-function levels(atrPct) {
-  return {
-    tp: Number(Math.max(TP_MIN_PCT, TP_ATR * atrPct).toFixed(3)),
-    sl: Number(Math.max(SL_MIN_PCT, SL_ATR * atrPct).toFixed(3))
-  };
+let lastSource = 'none';
+let lastSignalAt = 0;
+let telegramOffset = 0;
+let consecutiveErrors = 0;
+async function logEvent(type, message, data = {}) {
+if (!pool) return;
+try {
+await pool.query('INSERT INTO trade_eventos(tipo,mensagem,dados) VALUES($1,$2,$3)', [type, message, JSON.stringify(data)]);
+} catch (e) { console.error('[DB event]', errText(e)); }
 }
-
-// ── Telegram ────────────────────────────────────────────────────────────────
-
-async function tg(text) {
-  if (!BOT_TOKEN || !CHAT_ID) return false;
-  try {
-    const { data } = await axios.post(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      { chat_id: CHAT_ID, text, disable_web_page_preview: true, parse_mode: 'HTML' },
-      { timeout: 12000 }
-    );
-    return data && data.ok === true;
-  } catch (e) {
-    lastError = 'tg: ' + e.message;
-    console.error('[TG]', (e.response && e.response.data) || e.message);
-    return false;
-  }
-}
-
-// ── Mensagens (estilo SMS), placar e histórico ──────────────────────────────
-
-const LINE = '━━━━━━━━━━━━━━';
-const fTime = (ms) => new Date(ms).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: TIMEZONE });
-const fDate = (ms) => new Date(ms).toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit', timeZone: TIMEZONE });
-const dayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: TIMEZONE });
-const sideIcon = (side) => (side === 'COMPRA' ? '🟢' : '🔴');
-const stateIcon = (st) => ({ GREEN: '✅', G1: '🔁', LOSS: '❌', PENDENTE: '⏳', EXPIRADO: '⌛' }[st] || '•');
-const pctTxt = (v) => (v == null ? '' : (Number(v) >= 0 ? '+' : '') + Number(v).toFixed(2) + '%');
-
-// contagens: hoje (fuso configurado) ou total
-async function counts(daily) {
-  const where = daily
-    ? `WHERE criado_em >= (date_trunc('day', NOW() AT TIME ZONE $1::text) AT TIME ZONE $1::text)`
-    : `WHERE $1::text IS NOT NULL`;
-  const { rows } = await pool.query(
-    `SELECT COUNT(*) FILTER (WHERE estado='GREEN')::int AS g,
-            COUNT(*) FILTER (WHERE estado='G1')::int AS g1,
-            COUNT(*) FILTER (WHERE estado='LOSS')::int AS l,
-            COUNT(*) FILTER (WHERE estado='PENDENTE')::int AS p
-     FROM trade_sinais ${where}`,
-    [TIMEZONE]
-  );
-  return rows[0] || { g: 0, g1: 0, l: 0, p: 0 };
-}
-
-function boardLine(c) {
-  const settled = c.g + c.g1 + c.l;
-  const wr = settled ? Math.round(((c.g + c.g1) * 100) / settled) + '%' : '—';
-  return '✅ ' + c.g + '  🔁 ' + c.g1 + '  ❌ ' + c.l + '  🎯 ' + wr;
-}
-
-async function historyText(limit, daily) {
-  const cond = daily
-    ? `WHERE criado_em >= (date_trunc('day', NOW() AT TIME ZONE $2::text) AT TIME ZONE $2::text)`
-    : `WHERE $2::text IS NOT NULL`;
-  const q = await pool.query(
-    `SELECT id, direcao, estado, preco_entrada, preco_saida, pnl_pct, criado_em
-     FROM trade_sinais ${cond} ORDER BY id DESC LIMIT $1`,
-    [limit, TIMEZONE]
-  );
-  const d = await counts(true);
-  const t = await counts(false);
-  const head = daily
-    ? '🌙 <b>RESUMO DO DIA · ' + fDate(Date.now()) + '</b>'
-    : '📋 <b>HISTÓRICO · CAPUNGA TRADE</b>';
-  const rows = q.rows.map(function (r) {
-    const when = fTime(new Date(r.criado_em).getTime());
-    const px = Number(r.preco_entrada);
-    const out = r.preco_saida != null ? ' → ' + fmt(r.preco_saida) : '';
-    const res = r.pnl_pct != null ? ' · ' + pctTxt(r.pnl_pct) : '';
-    return stateIcon(r.estado) + ' #' + r.id + ' ' + sideIcon(r.direcao) + ' ' + r.direcao + ' · ' + fmt(px) + out + res + ' · ' + when;
-  });
-  return [
-    head,
-    LINE,
-    '📅 Hoje   ' + boardLine(d) + (d.p ? '  ⏳ ' + d.p : ''),
-    '🏆 Total  ' + boardLine(t),
-    LINE,
-    rows.length ? rows.join('\n') : 'Ainda sem sinais.',
-    LINE,
-    '✅ GREEN  🔁 GREEN no gale  ❌ LOSS  ⏳ em aberto'
-  ].join('\n');
-}
-
-function msgSignal(a, id, tpPrice, slPrice, d) {
-  const long = a.side === 'COMPRA';
-  const arr = function (t) { return t === 'ALTA' ? '▲' : t === 'BAIXA' ? '▼' : '►'; };
-  return [
-    sideIcon(a.side) + ' <b>' + a.side + ' · ' + SYMBOL + '</b>',
-    '🏦 Bybit · Perp · ordem a mercado',
-    '🕒 ' + fDate(Date.now()) + ' · ' + fTime(Date.now()),
-    LINE,
-    '🎯 <b>Entrada</b>  <code>' + fmt(a.price) + '</code>',
-    '✅ <b>TP</b>  <code>' + fmt(tpPrice) + '</code>  (+' + a.tpPct + '% lucro)',
-    '🛑 <b>SL</b>  <code>' + fmt(slPrice) + '</code>  (-' + a.slPct + '% risco)',
-    LINE,
-    '🔁 <b>Gale 1:</b> se o SL for tocado, re-entrar ' + a.side + ' a mercado (envio novo TP/SL)',
-    '⏱ Fecho por preço até ' + fTime(Date.now() + WINDOW_MS),
-    LINE,
-    '📊 Força <b>' + a.score + '/100</b> · RSI ' + a.rsi,
-    '📈 Tendência 15m ' + arr(a.trend15) + ' · 5m ' + arr(a.trend5),
-    '🧠 ' + a.tags.slice(0, 4).join(' · '),
-    LINE,
-    '🆔 #' + id + '  📅 Hoje ' + boardLine(d)
-  ].join('\n');
-}
-
-function msgGale(s, g, tpP, slP, late) {
-  const long = s.direcao === 'COMPRA';
-  return [
-    '🔁 <b>GALE 1 · #' + s.id + '</b>',
-    '⚠️ SL tocado — re-entrar ' + sideIcon(s.direcao) + ' <b>' + s.direcao + '</b> a mercado',
-    LINE,
-    '🎯 <b>Entrada</b>  <code>' + fmt(g) + '</code>',
-    '✅ <b>TP</b>  <code>' + fmt(long ? g * (1 + tpP / 100) : g * (1 - tpP / 100)) + '</code>',
-    '🛑 <b>SL</b>  <code>' + fmt(long ? g * (1 - slP / 100) : g * (1 + slP / 100)) + '</code>',
-    LINE,
-    '⚠️ Último gale: se falhar, é LOSS.' + (late ? '\n🕒 Apurado pelo histórico (bot estava inativo)' : '')
-  ].join('\n');
-}
-
-function msgResult(s, r, d, late) {
-  const win = r.state !== 'LOSS';
-  const title = r.state === 'GREEN' ? '✅ <b>GREEN</b>' : r.state === 'G1' ? '🔁 <b>GREEN no GALE 1</b>' : '❌ <b>LOSS</b>';
-  const lines = [
-    title + ' · #' + s.id,
-    sideIcon(s.direcao) + ' ' + s.direcao + ' · ' + SYMBOL,
-    LINE,
-    '🎯 Entrada  <code>' + fmt(r.ref) + '</code>',
-    '🏁 Saída  <code>' + fmt(r.exit) + '</code>',
-    (win ? '💰 Resultado  <b>' : '📉 Resultado  <b>') + pctTxt(r.pnl) + '</b>',
-    '🕒 ' + fTime(r.at)
-  ];
-  if (r.timeout) lines.push('ℹ️ Fechado no fim da janela, a favor da entrada');
-  if (r.state === 'LOSS') lines.push('⏸ Pausa de ' + Math.round(LOSS_PAUSE_MS / 60000) + ' min nos sinais');
-  if (late) lines.push('🕒 Apurado pelo histórico (bot estava inativo)');
-  lines.push(LINE, '📅 Hoje ' + boardLine(d));
-  return lines.join('\n');
-}
-
-// ── Comandos do Telegram (/historico /placar /ajuda) ────────────────────────
-
-let tgOffset = null;
-
-async function tgCommands() {
-  if (!BOT_TOKEN || !CHAT_ID) return;
-  try {
-    const base = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
-    if (tgOffset === null) {
-      // primeira vez: ignora mensagens antigas
-      const first = await axios.get(base, { params: { offset: -1, timeout: 0 }, timeout: 10000 });
-      const l = (first.data && first.data.result) || [];
-      tgOffset = l.length ? l[l.length - 1].update_id + 1 : 0;
-      return;
-    }
-    const { data } = await axios.get(base, {
-      params: { offset: tgOffset, timeout: 0, allowed_updates: JSON.stringify(['message', 'channel_post']) },
-      timeout: 10000
-    });
-    for (const u of (data && data.result) || []) {
-      tgOffset = u.update_id + 1;
-      const m = u.message || u.channel_post;
-      if (!m || !m.text || !m.chat || String(m.chat.id) !== CHAT_ID) continue;
-      const cmd = m.text.trim().split(/[\s@]/)[0].toLowerCase();
-      if (cmd === '/historico' || cmd === '/histórico') await tg(await historyText(10, false));
-      else if (cmd === '/placar') {
-        const d = await counts(true);
-        const t = await counts(false);
-        await tg('📊 <b>PLACAR</b>\n' + LINE + '\n📅 Hoje   ' + boardLine(d) + '\n🏆 Total  ' + boardLine(t));
-      } else if (cmd === '/ajuda' || cmd === '/start') {
-        await tg('🤖 <b>CAPUNGA TRADE</b>\n' + LINE + '\n/historico · últimos 10 sinais\n/placar · acertos de hoje e total\n/ajuda · esta mensagem');
-      }
-    }
-  } catch (e) { /* webhook ativo ou rede: ignora */ }
-}
-
-// resumo automático no fim do dia (23:55 no fuso configurado)
-let lastSummaryDay = null;
-async function dailySummary() {
-  const now = Date.now();
-  const hm = fTime(now);
-  const today = dayKey(now);
-  if (hm >= '23:55' && lastSummaryDay !== today) {
-    lastSummaryDay = today;
-    const d = await counts(true);
-    if (d.g + d.g1 + d.l + d.p > 0) await tg(await historyText(30, true));
-  }
-}
-
-// ── DB ──────────────────────────────────────────────────────────────────────
-
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS trade_sinais (
-      id BIGSERIAL PRIMARY KEY,
-      symbol TEXT NOT NULL,
-      direcao TEXT NOT NULL,
-      preco_entrada NUMERIC NOT NULL,
-      score INTEGER DEFAULT 0,
-      setup TEXT,
-      estado TEXT NOT NULL DEFAULT 'PENDENTE',
-      gale SMALLINT NOT NULL DEFAULT 0,
-      preco_saida NUMERIC,
-      pnl_pct NUMERIC,
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      resolvido_em TIMESTAMPTZ
-    );
-  `);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS score INTEGER DEFAULT 0`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS setup TEXT`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_saida NUMERIC`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS tp_pct NUMERIC`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS sl_pct NUMERIC`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS gale_preco NUMERIC`);
-  await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS ref_em TIMESTAMPTZ`);
-  // Tabela legada (v1/Bac Bo) pode ter colunas NOT NULL antigas, ex.: confluencia → deixa de bloquear o INSERT
-  await pool.query(`
-    DO $$
-    DECLARE r RECORD;
-    BEGIN
-      FOR r IN
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = current_schema()
-          AND table_name = 'trade_sinais'
-          AND is_nullable = 'NO'
-          AND column_default IS NULL
-          AND column_name NOT IN ('id','symbol','direcao','preco_entrada')
-      LOOP
-        EXECUTE format('ALTER TABLE trade_sinais ALTER COLUMN %I DROP NOT NULL', r.column_name);
-      END LOOP;
-    END $$;
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_ts_estado ON trade_sinais (estado, id DESC)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS trade_eventos (
-      id BIGSERIAL PRIMARY KEY,
-      sinal_id BIGINT,
-      tipo TEXT NOT NULL,
-      detalhe TEXT,
-      preco NUMERIC,
-      em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-  // Limpeza: resultados falsos com saída = entrada (bug de TP/SL nulos em sinais da versão antiga)
-  const bad = await pool.query(
-    `SELECT id FROM trade_sinais
-     WHERE estado IN ('GREEN','G1','LOSS') AND preco_saida IS NOT NULL AND preco_saida = preco_entrada`
-  );
-  if (bad.rows.length) {
-    const ids = bad.rows.map(function (r) { return r.id; });
-    await pool.query(`DELETE FROM trade_eventos WHERE sinal_id = ANY($1::bigint[])`, [ids]);
-    await pool.query(`DELETE FROM trade_sinais WHERE id = ANY($1::bigint[])`, [ids]);
-    console.log('[DB] removidos ' + ids.length + ' resultados falsos: #' + ids.join(', #'));
-  }
-  console.log('[DB] OK');
+if (!pool) throw new Error('DATABASE_URL não configurado. PostgreSQL é obrigatório para histórico e controlo de duplicados.');
+await pool.query(`
+CREATE TABLE IF NOT EXISTS trade_sinais (
+id BIGSERIAL PRIMARY KEY,
+symbol TEXT NOT NULL,
+direcao TEXT NOT NULL DEFAULT 'BUY',
+preco_entrada NUMERIC NOT NULL,
+preco_tp NUMERIC NOT NULL,
+preco_sl NUMERIC NOT NULL,
+score INTEGER NOT NULL,
+estado TEXT NOT NULL DEFAULT 'PENDENTE',
+tp_pct NUMERIC NOT NULL,
+sl_pct NUMERIC NOT NULL,
+preco_saida NUMERIC,
+pnl_pct NUMERIC,
+criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+resolvido_em TIMESTAMPTZ,
+expiracao_em TIMESTAMPTZ NOT NULL,
+metadados JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS trade_sinais_estado_idx ON trade_sinais(estado, criado_em DESC);
+CREATE INDEX IF NOT EXISTS trade_sinais_criado_idx ON trade_sinais(criado_em DESC);
+CREATE TABLE IF NOT EXISTS trade_eventos (
+id BIGSERIAL PRIMARY KEY,
+tipo TEXT NOT NULL,
+mensagem TEXT NOT NULL,
+dados JSONB NOT NULL DEFAULT '{}'::jsonb,
+criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS trade_config (
+chave TEXT PRIMARY KEY,
+valor TEXT NOT NULL,
+atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`);
+// Safe migrations for databases created by earlier versions.
+await pool.query(`
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_tp NUMERIC;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_sl NUMERIC;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS tp_pct NUMERIC;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS sl_pct NUMERIC;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_saida NUMERIC;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS expiracao_em TIMESTAMPTZ;
+ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS metadados JSONB NOT NULL DEFAULT '{}'::jsonb;
+`);
+// Existing legacy rows may not have an expiry; expire them conservatively.
+await pool.query(`UPDATE trade_sinais SET expiracao_em = COALESCE(expiracao_em, criado_em + INTERVAL '4 hours') WHERE expiracao_em IS N
+const { rows } = await pool.query("SELECT EXTRACT(EPOCH FROM MAX(criado_em))*1000 AS last_ms FROM trade_sinais");
+lastSignalAt = Number(rows[0]?.last_ms || 0);
 }
-
-async function pendingSignal() {
-  const { rows } = await pool.query(
-    `SELECT * FROM trade_sinais WHERE estado='PENDENTE' ORDER BY id ASC LIMIT 1`
-  );
-  return rows[0] || null;
+async function telegramSend(text) {
+if (!CFG.botToken || !CFG.chatId) return { skipped: true, reason: 'Telegram not configured' };
+try {
+const { data } = await axios.post(`https://api.telegram.org/bot${CFG.botToken}/sendMessage`, {
+chat_id: CFG.chatId, text, disable_web_page_preview: true
+}, { timeout: 12000 });
+if (!data?.ok) throw new Error(data?.description || 'Telegram API rejected message');
+return { sent: true };
+} catch (e) {
+await logEvent('telegram_error', errText(e));
+console.error('[Telegram send]', errText(e));
+return { sent: false, error: errText(e) };
 }
-
-async function logEv(sinalId, tipo, detalhe, preco = null) {
-  try {
-    await pool.query(
-      `INSERT INTO trade_eventos (sinal_id, tipo, detalhe, preco) VALUES ($1,$2,$3,$4)`,
-      [sinalId, tipo, detalhe, preco]
-    );
-  } catch (e) { console.error('[EV]', e.message); }
 }
-
-// ── Market data (Bybit primeiro, OKX fallback) ──────────────────────────────
-
-const BYBIT_HOSTS = ['https://api.bybit.com', 'https://api.bytick.com'];
-const HEADERS = { 'User-Agent': 'CapungaTrade/3.0', Accept: 'application/json' };
-
-async function fetchKlines(interval, limit) {
-  const tf = TF[interval];
-  const errs = [];
-
-  for (const host of BYBIT_HOSTS) {
-    try {
-      const { data } = await axios.get(
-        `${host}/v5/market/kline?category=${CATEGORY}&symbol=${SYMBOL}&interval=${tf.bybit}&limit=${Math.min(limit, 1000)}`,
-        { timeout: 9000, headers: HEADERS }
-      );
-      const list = data && data.retCode === 0 && data.result && data.result.list;
-      if (list && list.length) {
-        lastSource = 'bybit';
-        return list.slice().reverse().map(function (k) {
-          return { t: Number(k[0]), o: num(k[1]), h: num(k[2]), l: num(k[3]), c: num(k[4]), v: num(k[5]) };
-        });
-      }
-      errs.push('bybit:' + ((data && data.retMsg) || 'vazio'));
-    } catch (e) {
-      errs.push('bybit:' + ((e.response && e.response.status) || e.message));
-    }
-  }
-
-  try {
-    const inst = SYMBOL.replace('USDT', '-USDT');
-    const { data } = await axios.get(
-      `https://www.okx.com/api/v5/market/candles?instId=${inst}&bar=${tf.okx}&limit=${Math.min(limit, 300)}`,
-      { timeout: 9000, headers: HEADERS }
-    );
-    if (data && data.code === '0' && data.data && data.data.length) {
-      lastSource = 'okx';
-      return data.data.slice().reverse().map(function (k) {
-        return { t: Number(k[0]), o: num(k[1]), h: num(k[2]), l: num(k[3]), c: num(k[4]), v: num(k[5]) };
-      });
-    }
-    errs.push('okx');
-  } catch (e) { errs.push('okx:' + e.message); }
-
-  throw new Error('market_data fail: ' + errs.join(','));
-}
-
-async function fetchPrice(fallback) {
-  for (const host of BYBIT_HOSTS) {
-    try {
-      const { data } = await axios.get(
-        `${host}/v5/market/tickers?category=${CATEGORY}&symbol=${SYMBOL}`,
-        { timeout: 7000, headers: HEADERS }
-      );
-      const p = num(data && data.result && data.result.list && data.result.list[0] && data.result.list[0].lastPrice, 0);
-      if (p > 0) return p;
-    } catch (e) { /* tenta próximo */ }
-  }
-  return fallback;
-}
-
-// só velas já fechadas (a vela em formação distorce os indicadores)
-function closedOnly(candles, ms, at) {
-  const now = at == null ? Date.now() : at;
-  return candles.filter(function (k) { return k.t + ms <= now; });
-}
-
-// ── Indicators ──────────────────────────────────────────────────────────────
-
-function ema(arr, p) {
-  if (arr.length < p) return [];
-  const k = 2 / (p + 1);
-  let prev = arr.slice(0, p).reduce(function (a, b) { return a + b; }, 0) / p;
-  const out = [prev];
-  for (let i = p; i < arr.length; i++) {
-    prev = arr[i] * k + prev * (1 - k);
-    out.push(prev);
-  }
-  return out;
-}
-
-function sma(arr, p) {
-  if (arr.length < p) return [];
-  const out = [];
-  let s = 0;
-  for (let i = 0; i < arr.length; i++) {
-    s += arr[i];
-    if (i >= p) s -= arr[i - p];
-    if (i >= p - 1) out.push(s / p);
-  }
-  return out;
-}
-
-function rsi(closes, p) {
-  p = p || 14;
-  if (closes.length < p + 1) return [];
-  const ch = [];
-  for (let i = 1; i < closes.length; i++) ch.push(closes[i] - closes[i - 1]);
-  let ag = 0, al = 0;
-  for (let i = 0; i < p; i++) {
-    if (ch[i] >= 0) ag += ch[i];
-    else al -= ch[i];
-  }
-  ag /= p; al /= p;
-  const out = [al === 0 ? 100 : 100 - 100 / (1 + ag / al)];
-  for (let i = p; i < ch.length; i++) {
-    const g = ch[i] > 0 ? ch[i] : 0;
-    const l = ch[i] < 0 ? -ch[i] : 0;
-    ag = (ag * (p - 1) + g) / p;
-    al = (al * (p - 1) + l) / p;
-    out.push(al === 0 ? 100 : 100 - 100 / (1 + ag / al));
-  }
-  return out;
-}
-
-function macdHist(closes) {
-  const ef = ema(closes, 12);
-  const es = ema(closes, 26);
-  const off = 26 - 12;
-  const line = [];
-  for (let i = 0; i < es.length; i++) line.push(ef[i + off] - es[i]);
-  const sig = ema(line, 9);
-  const hist = [];
-  const so = line.length - sig.length;
-  for (let i = 0; i < sig.length; i++) hist.push(line[i + so] - sig[i]);
-  return hist;
-}
-
-function atr(h, l, c, p) {
-  p = p || 14;
-  if (h.length < p + 1) return [];
-  const tr = [];
-  for (let i = 1; i < h.length; i++) {
-    tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
-  }
-  return sma(tr, p);
-}
-
-function trendOf(candles) {
-  const closes = candles.map(function (x) { return x.c; });
-  const e9 = ema(closes, 9);
-  const e21 = ema(closes, 21);
-  if (!e9.length || !e21.length) return 'NEUTRO';
-  const a = e9[e9.length - 1], b = e21[e21.length - 1], px = closes[closes.length - 1];
-  if (a > b && px > b) return 'ALTA';
-  if (a < b && px < b) return 'BAIXA';
-  return 'NEUTRO';
-}
-
-// ── Strategy (velas FECHADAS) ───────────────────────────────────────────────
-// Regras duras: 5m e 15m têm de concordar com a direção.
-// Pontuação: tendência (40) + stack EMA (12) + pullback (15) + RSI (10) + MACD (12) + volume (8)
-
-function analyze(c1, c5, c15) {
-  if (!c1 || c1.length < 60) return { ok: false, reason: 'dados_1m', buy: 0, sell: 0 };
-  if (!c5 || c5.length < 30) return { ok: false, reason: 'dados_5m', buy: 0, sell: 0 };
-  if (!c15 || c15.length < 30) return { ok: false, reason: 'dados_15m', buy: 0, sell: 0 };
-
-  const closes = c1.map(function (x) { return x.c; });
-  const highs = c1.map(function (x) { return x.h; });
-  const lows = c1.map(function (x) { return x.l; });
-  const vols = c1.map(function (x) { return x.v; });
-
-  const e9 = ema(closes, 9);
-  const e21 = ema(closes, 21);
-  const e50 = ema(closes, 50);
-  const r14 = rsi(closes, 14);
-  const mh = macdHist(closes);
-  const a14 = atr(highs, lows, closes, 14);
-  const vSma = sma(vols, 20);
-
-  if (!e9.length || !e21.length || !e50.length || r14.length < 2 || mh.length < 2 || !a14.length) {
-    return { ok: false, reason: 'indicadores', buy: 0, sell: 0 };
-  }
-
-  const i = c1.length - 1;
-  const k = c1[i];
-  const price = k.c;
-  const E9 = e9[e9.length - 1];
-  const E21 = e21[e21.length - 1];
-  const E50 = e50[e50.length - 1];
-  const R = r14[r14.length - 1];
-  const Rp = r14[r14.length - 2];
-  const H = mh[mh.length - 1];
-  const Hp = mh[mh.length - 2];
-  const A = a14[a14.length - 1];
-  const volM = vSma[vSma.length - 1] || k.v;
-  const atrPct = (A / price) * 100;
-  const trend5 = trendOf(c5);
-  const trend15 = trendOf(c15);
-
-  const minLow4 = Math.min.apply(null, lows.slice(-4));
-  const maxHigh4 = Math.max.apply(null, highs.slice(-4));
-
-  function scoreSide(up) {
-    let sc = 0;
-    const tg = [];
-    const want = up ? 'ALTA' : 'BAIXA';
-    const t15ok = trend15 === want;
-    const t5ok = trend5 === want;
-    if (t15ok) { sc += 20; tg.push('15m ' + trend15); }
-    if (t5ok) { sc += 20; tg.push('5m ' + trend5); }
-
-    const stack = up ? (E9 > E21 && E21 > E50) : (E9 < E21 && E21 < E50);
-    if (stack) { sc += 12; tg.push('EMA 9/21/50 alinhadas'); }
-
-    const pull = up ? (minLow4 <= E21 && price > E9) : (maxHigh4 >= E21 && price < E9);
-    if (pull) { sc += 15; tg.push('Pullback EMA21 retomado'); }
-
-    if (up) {
-      if (R >= 40 && R <= 62 && R > Rp) { sc += 10; tg.push('RSI ' + R.toFixed(0) + ' a subir'); }
-      if (R > 75) sc -= 15;
-    } else {
-      if (R >= 38 && R <= 60 && R < Rp) { sc += 10; tg.push('RSI ' + R.toFixed(0) + ' a descer'); }
-      if (R < 25) sc -= 15;
-    }
-
-    if (up ? (H > 0 && H > Hp) : (H < 0 && H < Hp)) { sc += 12; tg.push(up ? 'MACD a reforçar' : 'MACD a enfraquecer'); }
-
-    if (k.v > volM * 1.1 && (up ? price > k.o : price < k.o)) { sc += 8; tg.push('Volume confirma'); }
-
-    return { sc: clamp(sc, 0, 100), tags: tg, aligned: t15ok && t5ok };
-  }
-
-  const B = scoreSide(true);
-  const S = scoreSide(false);
-
-  const base = {
-    buy: B.sc, sell: S.sc, price: price, rsi: Number(R.toFixed(1)),
-    trend5: trend5, trend15: trend15, atrPct: Number(atrPct.toFixed(3)), candleT: k.t
-  };
-
-  if (atrPct < ATR_MIN_PCT) return Object.assign(base, { ok: false, reason: 'mercado_parado' });
-  if (atrPct > ATR_MAX_PCT) return Object.assign(base, { ok: false, reason: 'volatilidade_extrema' });
-  if ((k.h - k.l) > 3 * A) return Object.assign(base, { ok: false, reason: 'vela_espigada' });
-
-  let side = null, pick = null;
-  if (B.aligned && B.sc >= MIN_SCORE && B.sc >= S.sc + 10) { side = 'COMPRA'; pick = B; }
-  else if (S.aligned && S.sc >= MIN_SCORE && S.sc >= B.sc + 10) { side = 'VENDA'; pick = S; }
-
-  if (!side) return Object.assign(base, { ok: false, reason: 'sem_setup' });
-
-  const lv = levels(atrPct);
-  return Object.assign(base, {
-    ok: true, side: side, score: pick.sc, tags: pick.tags,
-    tpPct: lv.tp, slPct: lv.sl, reason: 'setup_ok'
-  });
-}
-
-// ── Lifecycle ───────────────────────────────────────────────────────────────
-// Sem "expirado": todo sinal fecha como GREEN / G1 / LOSS.
-// Se o bot esteve a dormir, ao acordar reconstrói o que aconteceu a partir das
-// velas de 1m desde a entrada (replay cronológico) e atualiza o histórico.
-// Fim da janela (SINAL_EXPIRA_MS) sem TP/SL: fecha pelo preço — a favor = GREEN, contra = gale/LOSS.
-
-const WINDOW_MS = SINAL_EXPIRA_MS;
-
-// Velas de 1m desde startMs até agora (paginado, 1000 por pedido)
-async function fetchRange(startMs) {
-  const endAll = Date.now();
-  let cursor = Math.max(startMs, endAll - 13 * 24 * 3600 * 1000);
-  const out = [];
-  for (let n = 0; n < 20 && cursor < endAll; n++) {
-    const end = Math.min(endAll, cursor + 1000 * 60000 - 1);
-    let list = null;
-    for (const host of BYBIT_HOSTS) {
-      try {
-        const { data } = await axios.get(
-          `${host}/v5/market/kline?category=${CATEGORY}&symbol=${SYMBOL}&interval=1&start=${cursor}&end=${end}&limit=1000`,
-          { timeout: 12000, headers: HEADERS }
-        );
-        const l = data && data.retCode === 0 && data.result && data.result.list;
-        if (l) { list = l; break; }
-      } catch (e) { /* tenta próximo host */ }
-    }
-    if (!list) return null;
-    list.forEach(function (k) {
-      out.push({ t: Number(k[0]), o: num(k[1]), h: num(k[2]), l: num(k[3]), c: num(k[4]), v: num(k[5]) });
-    });
-    cursor = end + 1;
-  }
-  out.sort(function (a, b) { return a.t - b.t; });
-  return out;
-}
-
-// Replay cronológico de um sinal pendente sobre as velas (SL tem prioridade se ambos na mesma vela)
-function replaySignal(s, candles, nowMs, px) {
-  const long = s.direcao === 'COMPRA';
-  const tpP = pos(s.tp_pct, TP_MIN_PCT);
-  const slP = pos(s.sl_pct, SL_MIN_PCT);
-  let stage = Number(s.gale);
-  let ref = stage ? num(s.gale_preco) : num(s.preco_entrada);
-  let refMs = new Date(s.ref_em || s.criado_em).getTime();
-  let galeEntry = stage ? ref : null;
-
-  const pnlOf = function (exit) {
-    return Number(((long ? exit - ref : ref - exit) / ref * 100).toFixed(4));
-  };
-  const done = function (state, exit, at, extra) {
-    return Object.assign({
-      state: state, stage: stage, ref: ref, galeEntry: galeEntry,
-      exit: exit, pnl: pnlOf(exit), at: at
-    }, extra || {});
-  };
-
-  for (const k of candles) {
-    if (k.t < refMs) continue;
-    const endMs = k.t + 60000;
-    const closed = endMs <= nowMs;
-    const tpPrice = long ? ref * (1 + tpP / 100) : ref * (1 - tpP / 100);
-    const slPrice = long ? ref * (1 - slP / 100) : ref * (1 + slP / 100);
-    const hitSL = long ? k.l <= slPrice : k.h >= slPrice;
-    const hitTP = long ? k.h >= tpPrice : k.l <= tpPrice;
-    const at = Math.min(endMs, nowMs);
-
-    let loss = null;
-    if (hitSL) {
-      loss = { exit: slPrice, entry: closed ? k.c : px };
-    } else if (hitTP) {
-      return done(stage ? 'G1' : 'GREEN', tpPrice, at);
-    } else if (closed && endMs >= refMs + WINDOW_MS) {
-      const fav = long ? k.c > ref : k.c < ref;
-      if (fav) return done(stage ? 'G1' : 'GREEN', k.c, at, { timeout: true });
-      loss = { exit: k.c, entry: k.c };
-    }
-
-    if (loss) {
-      if (stage >= MAX_GALE) return done('LOSS', loss.exit, at);
-      stage = 1;
-      ref = loss.entry;
-      galeEntry = ref;
-      refMs = at;
-    }
-  }
-  return { state: 'PENDENTE', stage: stage, ref: ref, galeEntry: galeEntry, refMs: refMs };
-}
-
-async function resolvePending(raw1, px) {
-  const s = await pendingSignal();
-  if (!s) return;
-
-  const nowMs = Date.now();
-  const refMs0 = new Date(s.ref_em || s.criado_em).getTime();
-  let candles = raw1;
-  if (raw1.length && refMs0 < raw1[0].t) {
-    // bot esteve inativo mais que as velas já carregadas → busca o histórico em falta
-    const rng = await fetchRange(refMs0);
-    if (rng && rng.length) candles = rng;
-  }
-
-  const r = replaySignal(s, candles, nowMs, px);
-  const tpP = pos(s.tp_pct, TP_MIN_PCT);
-  const slP = pos(s.sl_pct, SL_MIN_PCT);
-
-  if (r.state === 'PENDENTE') {
-    if (r.stage > Number(s.gale)) {
-      await pool.query(
-        `UPDATE trade_sinais SET gale=1, gale_preco=$2, ref_em=to_timestamp($3::double precision / 1000.0)
-         WHERE id=$1 AND estado='PENDENTE'`,
-        [s.id, r.galeEntry, r.refMs]
-      );
-      await logEv(s.id, 'GALE1', 'SL tocado', r.galeEntry);
-      await tg(msgGale(s, r.galeEntry, tpP, slP, nowMs - r.refMs > 180000));
-    }
-    return;
-  }
-
-  await pool.query(
-    `UPDATE trade_sinais
-     SET estado=$2, gale=$3, gale_preco=$4, preco_saida=$5, pnl_pct=$6,
-         resolvido_em=to_timestamp($7::double precision / 1000.0)
-     WHERE id=$1 AND estado='PENDENTE'`,
-    [s.id, r.state, r.stage, r.galeEntry, r.exit, r.pnl, r.at]
-  );
-  await logEv(s.id, 'FECHO', r.state + (r.timeout ? ' (fim da janela)' : ''), r.exit);
-  if (r.state === 'LOSS') lastLossAt = r.at;
-
-  const d = await counts(true);
-  await tg(msgResult(s, r, d, nowMs - r.at > 180000));
-}
-
-async function openSignal(a) {
-  if (await pendingSignal()) return null;
-  if (Date.now() - lastSignalAt < ANTI_SPAM_MS) return null;
-  if (Date.now() - lastLossAt < LOSS_PAUSE_MS) return null;
-
-  const long = a.side === 'COMPRA';
-  const tpPrice = long ? a.price * (1 + a.tpPct / 100) : a.price * (1 - a.tpPct / 100);
-  const slPrice = long ? a.price * (1 - a.slPct / 100) : a.price * (1 + a.slPct / 100);
-
-  const { rows } = await pool.query(
-    `INSERT INTO trade_sinais (symbol, direcao, preco_entrada, score, setup, tp_pct, sl_pct, ref_em)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) RETURNING id`,
-    [SYMBOL, a.side, a.price, a.score, a.tags.join(' | '), a.tpPct, a.slPct]
-  );
-  const id = rows[0] && rows[0].id;
-  if (!id) return null;
-
-  lastSignalAt = Date.now();
-  signalsSent += 1;
-  await logEv(id, 'ENTRADA', a.side, a.price);
-
-  const d = await counts(true);
-  await tg(msgSignal(a, id, tpPrice, slPrice, d));
-  console.log('[SINAL] #' + id + ' ' + a.side + ' @ ' + a.price + ' score=' + a.score);
-  return id;
-}
-
-// ── Instância única (evita sinais/mensagens duplicados em deploys sobrepostos) ──
-
-let lockClient = null;
-let isLeader = false;
-
-async function ensureLeader() {
-  if (isLeader && lockClient) return true;
-  try {
-    if (!lockClient) {
-      const c = await pool.connect();
-      lockClient = c;
-      c.on('error', function () {
-        isLeader = false;
-        lockClient = null;
-        try { c.release(true); } catch (e) { /* ignora */ }
-      });
-    }
-    const { rows } = await lockClient.query('SELECT pg_try_advisory_lock(727301) AS ok');
-    isLeader = rows[0].ok === true;
-    if (isLeader) console.log('[LOCK] instância líder');
-    else {
-      console.log('[LOCK] outra instância ativa, em espera');
-      lockClient.release();
-      lockClient = null;
-    }
-    return isLeader;
-  } catch (e) {
-    isLeader = false;
-    if (lockClient) { try { lockClient.release(true); } catch (x) { /* ignora */ } lockClient = null; }
-    return false;
-  }
-}
-
-// ── Loop ────────────────────────────────────────────────────────────────────
-
-async function tick() {
-  if (busy) return;
-  busy = true;
-  try {
-    if (!(await ensureLeader())) return;
-    await tgCommands();
-    await dailySummary();
-
-    const res = await Promise.all([
-      fetchKlines('1m', 200),
-      fetchKlines('5m', 120),
-      fetchKlines('15m', 100)
-    ]);
-    const raw1 = res[0];
-    const px = await fetchPrice(raw1[raw1.length - 1].c);
-
-    await resolvePending(raw1, px);
-
-    const c1 = closedOnly(raw1, TF['1m'].ms);
-    const c5 = closedOnly(res[1], TF['5m'].ms);
-    const c15 = closedOnly(res[2], TF['15m'].ms);
-
-    const a = analyze(c1, c5, c15);
-    lastAnalysis = Object.assign({}, a, { ts: nowISO(), livePrice: px, source: lastSource });
-
-    if (a.ok) await openSignal(a);
-    else console.log('[SCAN] C=' + a.buy + ' V=' + a.sell + ' min=' + MIN_SCORE + ' · ' + a.reason);
-
-    lastError = null;
-  } catch (e) {
-    lastError = e.message;
-    console.error('[TICK]', e.message);
-  } finally {
-    busy = false;
-  }
-}
-
-// ── Backtest (taxa de acerto real nos dados recentes) ───────────────────────
-
-function simulate(k1, i, side, price, atrPct) {
-  const long = side === 'COMPRA';
-  const lv = levels(atrPct);
-  const W = Math.ceil(WINDOW_MS / 60000);
-  let ref = price;
-  let stage = 0;
-  let startJ = i;
-  for (let j = i + 1; j < k1.length; j++) {
-    const k = k1[j];
-    const sl = long ? ref * (1 - lv.sl / 100) : ref * (1 + lv.sl / 100);
-    const tp = long ? ref * (1 + lv.tp / 100) : ref * (1 - lv.tp / 100);
-    const hitSL = long ? k.l <= sl : k.h >= sl;
-    const hitTP = long ? k.h >= tp : k.l <= tp;
-    let lost = false;
-    if (hitSL) lost = true;
-    else if (hitTP) return { res: stage ? 'G1' : 'GREEN', end: j };
-    else if (j - startJ >= W) {
-      if (long ? k.c > ref : k.c < ref) return { res: stage ? 'G1' : 'GREEN', end: j };
-      lost = true;
-    }
-    if (lost) {
-      if (stage === 0) { stage = 1; ref = k.c; startJ = j; }
-      else return { res: 'LOSS', end: j };
-    }
-  }
-  return { res: 'ABERTO', end: k1.length };
-}
-
-async function backtest() {
-  const res = await Promise.all([
-    fetchKlines('1m', 1000),
-    fetchKlines('5m', 1000),
-    fetchKlines('15m', 1000)
-  ]);
-  const k1 = closedOnly(res[0], TF['1m'].ms);
-  const k5 = res[1];
-  const k15 = res[2];
-
-  const out = { GREEN: 0, G1: 0, LOSS: 0, ABERTO: 0 };
-  let signals = 0;
-  let i = 120;
-  while (i < k1.length - 2) {
-    const tClose = k1[i].t + TF['1m'].ms;
-    const s1 = k1.slice(i - 119, i + 1);
-    const s5 = closedOnly(k5, TF['5m'].ms, tClose).slice(-120);
-    const s15 = closedOnly(k15, TF['15m'].ms, tClose).slice(-100);
-    const a = analyze(s1, s5, s15);
-    if (a.ok) {
-      signals += 1;
-      const r = simulate(k1, i, a.side, a.price, a.atrPct);
-      out[r.res] += 1;
-      i = Math.max(i + 1, r.end + Math.ceil(ANTI_SPAM_MS / 60000));
-      if (r.res === 'LOSS') i += Math.ceil(LOSS_PAUSE_MS / 60000);
-    } else {
-      i += 1;
-    }
-  }
-  const settled = out.GREEN + out.G1 + out.LOSS;
-  const wins = out.GREEN + out.G1;
-  return {
-    candles1m: k1.length,
-    horas: Number((k1.length / 60).toFixed(1)),
-    signals: signals,
-    results: out,
-    winrate: settled ? Number(((wins * 100) / settled).toFixed(1)) : null,
-    winrateSemGale: settled ? Number(((out.GREEN * 100) / settled).toFixed(1)) : null,
-    nota: 'Sem taxas/slippage. Amostra curta (~16h de 1m): use como indicação, não como garantia.'
-  };
-}
-
-// ── HTTP ────────────────────────────────────────────────────────────────────
-
-app.get('/', function (_req, res) {
-  res.json({
-    name: 'CAPUNGA TRADE', symbol: SYMBOL, exchange: 'bybit', status: 'online',
-    version: '3.0', gale: MAX_GALE, mode: 'opportunity-based',
-    disclaimer: 'Experimental. Not financial advice.'
-  });
+async function fetchBybitCandles(interval) {
+const { data } = await axios.get(`${CFG.bybitUrl}/v5/market/kline`, {
+params: { category: 'spot', symbol: CFG.symbol, interval: String(interval), limit: CFG.candleLimit }, timeout: 12000
 });
-
-app.get('/health', async function (_req, res) {
-  try {
-    await pool.query('SELECT 1');
-    res.json({
-      ok: true, db: 'up',
-      lastAnalysis: (lastAnalysis && lastAnalysis.ts) || null,
-      source: lastSource, lastError: lastError, signalsSent: signalsSent,
-      telegram: Boolean(BOT_TOKEN && CHAT_ID)
-    });
-  } catch (e) {
-    res.status(503).json({ ok: false, error: e.message });
-  }
+if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) throw new Error(`Bybit kline: ${data?.retMsg || 'resposta inválida'}`);
+const ms = Number(interval) * 60000;
+return data.result.list.map(r => ({ time: Number(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]),
+.filter(c => [c.time,c.open,c.high,c.low,c.close,c.volume].every(Number.isFinite) && c.close > 0)
+.sort((a,b) => a.time - b.time).filter(c => c.time + ms <= Date.now());
+}
+async function fetchOkxCandles(interval) {
+const instId = CFG.symbol.replace(/USDT$/, '-USDT');
+const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
+params: { instId, bar: `${interval}m`, limit: String(Math.min(CFG.candleLimit, 300)) }, timeout: 12000
 });
-
-app.get('/status', async function (_req, res) {
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        COUNT(*) FILTER (WHERE estado='GREEN')::int AS green,
-        COUNT(*) FILTER (WHERE estado='G1')::int AS g1,
-        COUNT(*) FILTER (WHERE estado='LOSS')::int AS loss,
-        COUNT(*) FILTER (WHERE estado='PENDENTE')::int AS pending,
-        COUNT(*) FILTER (WHERE estado='EXPIRADO')::int AS expired
-      FROM trade_sinais
-    `);
-    const t = rows[0] || {};
-    const settled = (t.green || 0) + (t.g1 || 0) + (t.loss || 0);
-    const wins = (t.green || 0) + (t.g1 || 0);
-    const winrate = settled ? Number(((wins * 100) / settled).toFixed(2)) : null;
-    const pend = await pendingSignal();
-
-    res.json({
-      ok: true, symbol: SYMBOL, source: lastSource,
-      config: {
-        minScore: MIN_SCORE, gale: MAX_GALE, tpAtr: TP_ATR, slAtr: SL_ATR,
-        tpMinPct: TP_MIN_PCT, slMinPct: SL_MIN_PCT, expiraMs: SINAL_EXPIRA_MS,
-        antiSpamMs: ANTI_SPAM_MS, lossPauseMs: LOSS_PAUSE_MS
-      },
-      stats: Object.assign({}, t, { settled: settled, winrate: winrate }),
-      pending: pend ? {
-        id: pend.id, side: pend.direcao, entry: pend.preco_entrada,
-        gale: pend.gale, galeEntry: pend.gale_preco, at: pend.criado_em
-      } : null,
-      lastAnalysis: lastAnalysis, lastError: lastError
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+if (data?.code !== '0' || !Array.isArray(data?.data)) throw new Error('OKX candles response invalid');
+const ms = Number(interval) * 60000;
+return data.data.map(r => ({ time: Number(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]), volume
+.filter(c => [c.time,c.open,c.high,c.low,c.close,c.volume].every(Number.isFinite) && c.close > 0)
+.sort((a,b) => a.time - b.time).filter(c => c.time + ms <= Date.now());
+}
+async function fetchMarketBundle() {
+// Fetch all timeframes from the same exchange to avoid mixing market sources.
+try {
+const [m1,m5,m15] = await Promise.all([fetchBybitCandles(1),fetchBybitCandles(5),fetchBybitCandles(15)]);
+if ([m1,m5,m15].some(a => a.length < 60)) throw new Error('Bybit returned insufficient closed candles');
+lastSource = 'bybit-spot';
+return { m1,m5,m15,source:lastSource };
+} catch (bybitError) {
+try {
+const [m1,m5,m15] = await Promise.all([fetchOkxCandles(1),fetchOkxCandles(5),fetchOkxCandles(15)]);
+if ([m1,m5,m15].some(a => a.length < 60)) throw new Error('OKX returned insufficient closed candles');
+lastSource = 'okx-spot-fallback';
+return { m1,m5,m15,source:lastSource };
+} catch (okxError) {
+throw new Error(`Market data unavailable. Bybit: ${errText(bybitError)}; OKX: ${errText(okxError)}`);
+}
+}
+}
+async function fetchPrice(source = 'bybit-spot') {
+if (source === 'okx-spot-fallback') {
+const instId = CFG.symbol.replace(/USDT$/, '-USDT');
+const { data } = await axios.get('https://www.okx.com/api/v5/market/ticker', { params: { instId }, timeout: 10000 });
+const p = Number(data?.data?.[0]?.last);
+if (data?.code !== '0' || !Number.isFinite(p) || p <= 0) throw new Error('OKX ticker unavailable');
+return p;
+}
+const { data } = await axios.get(`${CFG.bybitUrl}/v5/market/tickers`, { params: { category:'spot', symbol:CFG.symbol }, timeout:10000 }
+const p = Number(data?.result?.list?.[0]?.lastPrice);
+if (data?.retCode !== 0 || !Number.isFinite(p) || p <= 0) throw new Error('Bybit ticker unavailable');
+return p;
+}
+function ema(values, period) {
+if (values.length < period) return null;
+const k = 2 / (period + 1);
+let v = values.slice(0, period).reduce((a,b) => a+b, 0) / period;
+for (let i=period; i<values.length; i++) v = values[i]*k + v*(1-k);
+return v;
+}
+function rsi(values, period=14) {
+if (values.length < period+1) return null;
+let gains=0, losses=0;
+for (let i=values.length-period; i<values.length; i++) { const d=values[i]-values[i-1]; if (d>0) gains+=d; else losses-=d; }
+if (losses===0) return gains===0 ? 50 : 100;
+const rs=(gains/period)/(losses/period); return 100-(100/(1+rs));
+}
+function atr(candles, period=14) {
+if (candles.length < period+1) return null;
+const tr=[];
+for (let i=1; i<candles.length; i++) { const c=candles[i], pc=candles[i-1].close; tr.push(Math.max(c.high-c.low,Math.abs(c.high-pc),Mat
+return tr.slice(-period).reduce((a,b)=>a+b,0)/period;
+}
+function adxApprox(candles, period=14) {
+if (candles.length < period+2) return null;
+let plus=0,minus=0,tr=0;
+for(let i=candles.length-period;i<candles.length;i++) { const c=candles[i],p=candles[i-1]; const up=c.high-p.high,down=p.low-c.low; plu
+if(tr<=0) return 0; const pdi=100*plus/tr,mdi=100*minus/tr; return pdi+mdi===0?0:100*Math.abs(pdi-mdi)/(pdi+mdi);
+}
+function getFeatures(candles) {
+const closes=candles.map(c=>c.close), last=candles[candles.length-1];
+return { close:last.close, ema9:ema(closes,9), ema21:ema(closes,21), ema50:ema(closes,50), rsi:rsi(closes), atr:atr(candles), adx:adxAp
+}
+function analyze(m1,m5,m15) {
+const a=getFeatures(m1), b=getFeatures(m5), c=getFeatures(m15);
+const reasons=[]; let score=0;
+if (b.ema9>b.ema21) { score++; reasons.push('EMA9 acima da EMA21 em 5m'); }
+if (c.ema9>c.ema21 && c.ema21>c.ema50) { score+=2; reasons.push('Tendência ascendente confirmada em 15m'); }
+if (b.rsi>=50 && b.rsi<=68) { score++; reasons.push('RSI de 5m em zona favorável'); }
+if (b.close>b.ema9 && b.ema9>b.ema21) { score++; reasons.push('Preço acima das médias curtas'); }
+if (b.adx>=18) { score++; reasons.push('Força de tendência suficiente'); }
+if (a.close>a.ema9 && a.ema9>a.ema21) { score++; reasons.push('Confirmação de momentum em 1m'); }
+if (b.rsi>72) { score-=2; reasons.push('Penalização por RSI sobrecomprado'); }
+if (c.ema9<c.ema21) { score-=2; reasons.push('Tendência de 15m não confirma compra'); }
+if (!Number.isFinite(b.atr) || b.atr<=0 || !Number.isFinite(b.close)) return { ok:false, score, reasons:['Indicadores insuficientes'],
+const entry=b.close;
+const slDist=Math.max(b.atr*CFG.slAtr,entry*CFG.slMinPct);
+const tpDist=Math.max(b.atr*CFG.tpAtr,entry*CFG.tpMinPct);
+const rr=tpDist/slDist;
+const ok=score>=CFG.minScore && rr>=CFG.minRR && entry>0;
+return { ok, direction:'BUY', score, entry, tp:entry+tpDist, sl:entry-slDist, tpPct:tpDist/entry*100, slPct:slDist/entry*100, rr, reaso
+features:{m1:{close:a.close,ema9:a.ema9,ema21:a.ema21},m5:{close:b.close,ema9:b.ema9,ema21:b.ema21,rsi:b.rsi,atr:b.atr,adx:b.adx},m15
+}
+async function pendingSignal(client = pool) {
+const { rows } = await client.query("SELECT * FROM trade_sinais WHERE estado='PENDENTE' ORDER BY id DESC LIMIT 1");
+return rows[0] || null;
+}
+async function resolvePending(price, candles5m) {
+const signal = await pendingSignal();
+if (!signal) return;
+const createdAt = new Date(signal.criado_em).getTime();
+const expiresAt = new Date(signal.expiracao_em).getTime();
+const sl = Number(signal.preco_sl);
+const tp = Number(signal.preco_tp);
+const entry = Number(signal.preco_entrada);
+if (![createdAt, expiresAt, sl, tp, entry].every(Number.isFinite)) {
+await logEvent('signal_data_error', 'Sinal pendente tem dados inválidos', { id: signal.id });
+return;
+}
+// Replays every available closed candle after signal creation, not just the
+// latest candle. This reduces missed TP/SL events after temporary downtime.
+// If TP and SL are both inside the same candle, conservatively count LOSS.
+const eligibleCandles = (candles5m || []).filter(c => {
+const candleCloseTime = c.time + 5 * 60000;
+return candleCloseTime > createdAt && c.time < expiresAt;
 });
-
-app.get('/sinais', async function (req, res) {
-  try {
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
-    const { rows } = await pool.query(
-      `SELECT id, symbol, direcao, preco_entrada, score, estado, gale, tp_pct, sl_pct,
-              preco_saida, pnl_pct, criado_em, resolvido_em
-       FROM trade_sinais ORDER BY id DESC LIMIT $1`,
-      [limit]
-    );
-    res.json({ ok: true, items: rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+for (const candle of eligibleCandles) {
+let state = null;
+let exit = null;
+if (candle.low <= sl) {
+state = 'LOSS';
+exit = sl;
+} else if (candle.high >= tp) {
+state = 'GREEN';
+exit = tp;
+}
+if (!state) continue;
+const pnl = (exit - entry) / entry * 100;
+const result = await pool.query(
+`UPDATE trade_sinais
+SET estado=$2, preco_saida=$3, pnl_pct=$4, resolvido_em=NOW()
+WHERE id=$1 AND estado='PENDENTE' RETURNING id`,
+[signal.id, state, exit, round(pnl, 5)]
+);
+if (!result.rowCount) return;
+await logEvent('signal_resolved', `Sinal ${state}`, {
+id: signal.id, exit, pnlPct: round(pnl, 5), candleTime: candle.time
 });
-
-app.post('/scan', async function (_req, res) {
-  try {
-    await tick();
-    res.json({ ok: true, lastAnalysis: lastAnalysis });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/backtest', async function (_req, res) {
-  try {
-    res.json({ ok: true, config: { minScore: MIN_SCORE, tpAtr: TP_ATR, slAtr: SL_ATR }, result: await backtest() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ── Boot ────────────────────────────────────────────────────────────────────
-
+await telegramSend(
+`${state === 'GREEN' ? '■ GREEN' : '■ LOSS'} — CAPUNGA TRADE\n` +
+`Sinal #${signal.id} · BTC/USDT Spot\n` +
+`Entrada de referência: ${round(entry, 2)}\n` +
+`Saída simulada: ${round(exit, 2)}\n` +
+`Variação bruta: ${round(pnl, 3)}%\n` +
+`Resultado apurado por vela fechada; taxas e slippage excluídos.`
+);
+return;
+}
+if (Date.now() >= expiresAt) {
+const result = await pool.query(
+`UPDATE trade_sinais SET estado='EXPIRADO', preco_saida=$2, resolvido_em=NOW()
+WHERE id=$1 AND estado='PENDENTE' RETURNING id`,
+[signal.id, price]
+);
+if (result.rowCount) {
+await logEvent('signal_expired', 'Sinal expirado', { id: signal.id, price });
+await telegramSend(
+`■ CAPUNGA TRADE — SINAL EXPIRADO\n#${signal.id} · BTC/USDT Spot\n` +
+`Preço de referência: ${round(price, 2)}\n` +
+`Expirado sem TP/SL confirmado nas velas disponíveis.`
+);
+}
+}
+}
+async function createSignal(a, source) {
+const client=await pool.connect(); let signal;
+try {
+await client.query('BEGIN');
+await client.query("SELECT pg_advisory_xact_lock(hashtext('capunga_trade_signal_engine'))");
+const pending=await pendingSignal(client);
+if(pending) { await client.query('COMMIT'); return { opened:false, reason:'pending_exists', id:pending.id }; }
+const recent=await client.query("SELECT criado_em FROM trade_sinais ORDER BY id DESC LIMIT 1");
+if(recent.rowCount && Date.now()-new Date(recent.rows[0].criado_em).getTime()<CFG.antiSpamMs) { await client.query('COMMIT'); return
+const expires=new Date(Date.now()+CFG.expiryMs);
+const result=await client.query(`INSERT INTO trade_sinais(symbol,direcao,preco_entrada,preco_tp,preco_sl,score,estado,tp_pct,sl_pct,e
+VALUES($1,'BUY',$2,$3,$4,$5,'PENDENTE',$6,$7,$8,$9::jsonb) RETURNING id,criado_em`,[
+CFG.symbol,a.entry,a.tp,a.sl,a.score,round(a.tpPct,5),round(a.slPct,5),expires,JSON.stringify({reasons:a.reasons,rr:a.rr,features:a
+]);
+signal=result.rows[0]; await client.query('COMMIT'); lastSignalAt=Date.now();
+} catch(e) { try{await client.query('ROLLBACK');}catch(_){} throw e; } finally { client.release(); }
+await logEvent('signal_opened','Novo sinal BUY',{id:signal.id,entry:a.entry,tp:a.tp,sl:a.sl,score:a.score,source});
+const msg=`■ CAPUNGA TRADE — NOVO SINAL\n\n■ ATIVO: ${CFG.symbol.replace('USDT','/USDT')} Spot\n■ DIREÇÃO: BUY / COMPRA\n■ SINAL: #${s
+await telegramSend(msg);
+return {opened:true,id:signal.id};
+}
+async function scanOnce() {
+if(scanning) return {skipped:true,reason:'scan_in_progress'};
+scanning=true;
+try {
+const bundle=await fetchMarketBundle();
+const price=await fetchPrice(bundle.source);
+await resolvePending(price,bundle.m5);
+const a=analyze(bundle.m1,bundle.m5,bundle.m15);
+lastAnalysis={at:new Date().toISOString(),symbol:CFG.symbol,market:'Spot',price,source:bundle.source,score:a.score,eligible:a.ok,sign
+lastError=null; consecutiveErrors=0;
+if (a.ok) {
+const deviation = Math.abs(price - a.entry) / a.entry;
+if (deviation > CFG.maxDeviationPct) {
+lastAnalysis.eligible = false;
+lastAnalysis.signal = null;
+lastAnalysis.signalResult = { opened: false, reason: 'entry_price_moved', deviationPct: round(deviation * 100, 4), maxDeviationPc
+} else {
+lastAnalysis.signalResult = await createSignal(a, bundle.source);
+}
+}
+await logEvent('analysis','Análise de mercado concluída',{price,score:a.score,eligible:a.ok,source:bundle.source});
+return lastAnalysis;
+} catch(e) {
+lastError=errText(e); consecutiveErrors++;
+await logEvent('scan_error',lastError,{consecutiveErrors});
+console.error('[SCAN]',lastError);
+throw e;
+} finally { scanning=false; }
+}
+function auth(req,res,next) {
+if(!CFG.apiKey) return res.status(503).json({ok:false,error:'API_KEY não configurada; endpoints de controlo bloqueados.'});
+const key=req.get('x-api-key')||'';
+if(key.length!==CFG.apiKey.length || key!==CFG.apiKey) return res.status(401).json({ok:false,error:'API key inválida.'});
+next();
+}
+function asyncRoute(fn) { return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next); }
+app.get('/',(_req,res)=>res.json({name:'CAPUNGA TRADE Signal Server Pro',version:'5.1.0',market:'BTC/USDT Spot',mode:'continuous manual s
+app.get('/health',asyncRoute(async(_req,res)=>{
+let db='up'; try { await pool.query('SELECT 1'); } catch(e) { db='down'; }
+const ok=db==='up'&&!shuttingDown;
+res.status(ok?200:503).json({ok,db,uptimeSeconds:Math.floor(process.uptime()),symbol:CFG.symbol,market:'Spot',source:lastSource,lastAna
+}));
+app.get('/status',asyncRoute(async(_req,res)=>{
+const {rows}=await pool.query(`SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,C
+const s=rows[0]; const settled=s.green+s.loss;
+const pnl=await pool.query("SELECT COALESCE(SUM(pnl_pct),0)::float AS total_pnl_pct FROM trade_sinais WHERE estado IN ('GREEN','LOSS')"
+res.json({ok:true,symbol:CFG.symbol,market:'Spot',ordersExecuted:false,source:lastSource,config:{loopMs:CFG.loopMs,minScore:CFG.minScor
+}));
+app.get('/sinais',asyncRoute(async(req,res)=>{
+const limit=Math.min(100,Math.max(1,Number(req.query.limit)||20));
+const {rows}=await pool.query('SELECT id,symbol,direcao,preco_entrada,preco_tp,preco_sl,score,estado,tp_pct,sl_pct,preco_saida,pnl_pct,
+res.json({ok:true,count:rows.length,items:rows});
+}));
+app.get('/eventos',auth,asyncRoute(async(req,res)=>{
+const limit=Math.min(100,Math.max(1,Number(req.query.limit)||30));
+const {rows}=await pool.query('SELECT id,tipo,mensagem,dados,criado_em FROM trade_eventos ORDER BY id DESC LIMIT $1',[limit]); res.json
+}));
+app.get('/placar',asyncRoute(async(_req,res)=>{
+const {rows}=await pool.query(`SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,C
+const s=rows[0], n=s.green+s.loss;
+res.json({ok:true,date:new Date().toISOString().slice(0,10),...s,settled:n,winrate:n?round(s.green/n*100,2):null});
+}));
+app.post('/scan',auth,asyncRoute(async(_req,res)=>res.json({ok:true,result:await scanOnce()})));
+app.post('/validar-entrada',auth,asyncRoute(async(req,res)=>{
+const id=Number(req.body?.signalId), capital=Number(req.body?.capital);
+if(!Number.isSafeInteger(id)||id<1) return res.status(400).json({ok:false,valid:false,error:'signalId inválido.'});
+if(!Number.isFinite(capital)||capital<=0) return res.status(400).json({ok:false,valid:false,error:'capital deve ser positivo e expresso
+const {rows}=await pool.query('SELECT * FROM trade_sinais WHERE id=$1',[id]); const s=rows[0];
+if(!s) return res.status(404).json({ok:false,valid:false,error:'Sinal não encontrado.'});
+if(s.estado!=='PENDENTE'||Date.now()>=new Date(s.expiracao_em).getTime()) return res.status(409).json({ok:true,valid:false,reason:'Sina
+const entry=Number(s.preco_entrada),tp=Number(s.preco_tp),sl=Number(s.preco_sl),price=await fetchPrice(lastSource);
+const deviation=Math.abs(price-entry)/entry;
+if(!(sl<price&&price<tp)||deviation>CFG.maxDeviationPct) return res.status(409).json({ok:true,valid:false,reason:'Preço atual fora dos
+const riskBudget=capital*CFG.riskPct, qtyRisk=riskBudget/(price-sl), qtyCapital=capital/price;
+const qty=Math.floor(Math.min(qtyRisk,qtyCapital)*1e6)/1e6, exposure=qty*price;
+if(qty<=0||exposure<5) return res.status(422).json({ok:true,valid:false,reason:'Capital insuficiente para o mínimo indicativo de 5 USDT
+res.json({ok:true,valid:true,mode:'manual',ordersSent:false,signalId:id,symbol:s.symbol,signalEntryReference:entry,assumedManualEntry:p
+}));
+app.use((err,_req,res,_next)=>{ console.error('[HTTP]',errText(err)); res.status(500).json({ok:false,error:errText(err)}); });
+async function telegramCommand(text, chatId) {
+if (!CFG.botToken || !CFG.allowTelegramCommands) return;
+// Restrict command replies to configured chat ID.
+if (String(chatId) !== String(CFG.chatId)) return;
+const command=String(text||'').trim().split(/\s+/)[0].split('@')[0].toLowerCase();
+const send=async msg=>axios.post(`https://api.telegram.org/bot${CFG.botToken}/sendMessage`,{chat_id:chatId,text:msg,disable_web_page_pr
+if(command==='/start'||command==='/ajuda'||command==='/help') return send('■ CAPUNGA TRADE Signal Server Pro\n/status — estado do motor
+if(command==='/status') {
+const r=await pool.query("SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,COUN
+return send(`■ CAPUNGA TRADE\nMotor: ${scanning?'a analisar':'ativo'}\nMercado: ${CFG.symbol} Spot\nFonte: ${lastSource}\nGREEN: ${r.
+}
+if(command==='/placar') {
+const r=await pool.query("SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,COUN
+const s=r.rows[0], settled=s.green+s.loss;
+return send(`■ PLACAR DO DIA\n■ GREEN: ${s.green}\n■ LOSS: ${s.loss}\n■ PENDENTES: ${s.pending}\nPrecisão histórica apurada: ${settl
+}
+if(command==='/historico') {
+const r=await pool.query('SELECT id,estado,preco_entrada,preco_saida,criado_em FROM trade_sinais ORDER BY id DESC LIMIT 10');
+const lines=r.rows.map(s=>`#${s.id} ${s.estado} | entrada ${round(Number(s.preco_entrada),2)} | saída ${s.preco_saida?round(Number(s.
+return send(`■ ÚLTIMOS SINAIS\n${lines||'Ainda não existem sinais.'}`);
+}
+if(command==='/scan') { await send('■ A analisar o mercado.'); try { const result=await scanOnce(); await send(`■ RESULTADO DA ANÁLISE\
+}
+async function pollTelegram() {
+if(!CFG.botToken||!CFG.allowTelegramCommands||shuttingDown) return;
+try {
+const {data}=await axios.get(`https://api.telegram.org/bot${CFG.botToken}/getUpdates`,{params:{offset:telegramOffset,timeout:0,allowe
+if(!data?.ok||!Array.isArray(data.result)) return;
+for(const update of data.result) {
+telegramOffset=Math.max(telegramOffset,Number(update.update_id)+1);
+const msg=update.message;
+if(msg?.text) await telegramCommand(msg.text,msg.chat?.id);
+}
+} catch(e) { console.error('[Telegram poll]',errText(e)); }
+}
+async function shutdown() {
+if(shuttingDown) return; shuttingDown=true;
+if(scanTimer) clearInterval(scanTimer); if(keepaliveTimer) clearInterval(keepaliveTimer); if(telegramTimer) clearInterval(telegramTimer
+if(server) await new Promise(resolve=>server.close(resolve));
+if(pool) await pool.end();
+process.exit(0);
+}
 async function main() {
-  await initDB();
-  const server = app.listen(PORT, '0.0.0.0', function () {
-    console.log('[HTTP] CAPUNGA TRADE v3 · Bybit · :' + PORT + ' · ' + SYMBOL);
-  });
-
-  await tick();
-  loopTimer = setInterval(function () {
-    tick().catch(function (e) { console.error(e.message); });
-  }, LOOP_MS);
-
-  // Render free adormece sem tráfego: auto-ping a cada 8 min
-  if (SELF_URL) {
-    keepTimer = setInterval(function () {
-      axios.get(SELF_URL + '/health', { timeout: 10000 }).catch(function () {});
-    }, 8 * 60 * 1000);
-    console.log('[KEEPALIVE] ' + SELF_URL);
-  } else {
-    console.log('[KEEPALIVE] sem URL (defina KEEPALIVE_URL ou use um ping externo em /health)');
-  }
-
-  function stop() {
-    if (loopTimer) clearInterval(loopTimer);
-    if (keepTimer) clearInterval(keepTimer);
-    if (lockClient) { try { lockClient.release(true); } catch (e) { /* ignora */ } }
-    server.close(async function () {
-      try { await pool.end(); } finally { process.exit(0); }
-    });
-    setTimeout(function () { process.exit(1); }, 6000).unref();
-  }
-  process.on('SIGTERM', stop);
-  process.on('SIGINT', stop);
+await initDB();
+server=app.listen(CFG.port,'0.0.0.0',()=>console.log(`[HTTP] CAPUNGA TRADE Signal Server Pro v5.1 · BTC/USDT Spot · :${CFG.port}`));
+try { await scanOnce(); } catch(e) { console.error('[initial scan]',errText(e)); }
+scanTimer=setInterval(()=>scanOnce().catch(()=>{}),CFG.loopMs);
+if(CFG.keepaliveUrl) keepaliveTimer=setInterval(()=>axios.get(CFG.keepaliveUrl.replace(/\/$/,'')+'/health',{timeout:10000}).catch(()=>{
+if(CFG.botToken&&CFG.allowTelegramCommands) { telegramTimer=setInterval(()=>pollTelegram().catch(()=>{}),CFG.telegramPollMs); pollTeleg
+process.on('SIGTERM',shutdown); process.on('SIGINT',shutdown);
 }
-
-main().catch(function (e) {
-  console.error('[FATAL]', e);
-  process.exit(1);
-});
+main().catch(e=>{console.error('[FATAL]',errText(e));process.exit(1);});
