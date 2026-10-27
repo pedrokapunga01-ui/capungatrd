@@ -1,9 +1,14 @@
 {
   "name": "capunga-trade",
-  "version": "1.0.0",
+  "version": "3.0.0",
+  "description": "CAPUNGA TRADE - BTC Signal Engine (Bybit)",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "npm install --no-audit --no-fund && node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "axios": "^1.7.0",
     "cors": "^2.8.5",
