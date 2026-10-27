@@ -171,33 +171,42 @@ async function criarTabelas() {
   console.log('[DB] Tabelas Capunga Trade verificadas.');
 }
 
-// ─── Market data (Binance public — funciona na maioria dos hosts) ──────────
+// ─── Market data (multi-fonte para evitar bloqueio 451 na Render) ───────────
+
+function mapIntervalOkx(interval) {
+  if (interval === '1m') return '1m';
+  if (interval === '5m') return '5m';
+  if (interval === '15m') return '15m';
+  return '1m';
+}
+
+function mapIntervalKucoin(interval) {
+  if (interval === '1m') return '1min';
+  if (interval === '5m') return '5min';
+  if (interval === '15m') return '15min';
+  return '1min';
+}
+
+function mapIntervalBybit(interval) {
+  if (interval === '1m') return '1';
+  if (interval === '5m') return '5';
+  if (interval === '15m') return '15';
+  return '1';
+}
 
 async function fetchKlines(interval = '1m', limit = 120) {
-  // Binance public REST (sem chave)
-  const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${interval}&limit=${limit}`;
+  const headers = { 'User-Agent': 'CapungaTrade/1.1', Accept: 'application/json' };
+  const errors = [];
+
+  // 1) OKX (geralmente acessível a partir da Render)
   try {
-    const { data } = await axios.get(url, {
-      timeout: 10000,
-      headers: { 'User-Agent': 'CapungaTrade/1.0' }
-    });
-    if (!Array.isArray(data)) throw new Error('formato inválido');
-    return data.map(k => ({
-      openTime: Number(k[0]),
-      open: num(k[1]),
-      high: num(k[2]),
-      low: num(k[3]),
-      close: num(k[4]),
-      volume: num(k[5]),
-      closeTime: Number(k[6])
-    }));
-  } catch (err) {
-    // Fallback Bybit
-    try {
-      const bybitUrl = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${SYMBOL}&interval=${interval === '1m' ? '1' : interval === '5m' ? '5' : '1'}&limit=${limit}`;
-      const { data } = await axios.get(bybitUrl, { timeout: 10000 });
-      const list = data?.result?.list || [];
-      return list.reverse().map(k => ({
+    const instId = SYMBOL.replace('USDT', '-USDT'); // BTCUSDT → BTC-USDT
+    const bar = mapIntervalOkx(interval);
+    const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit}`;
+    const { data } = await axios.get(url, { timeout: 10000, headers });
+    if (data?.code === '0' && Array.isArray(data.data) && data.data.length) {
+      // OKX devolve [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm] — mais recente primeiro
+      return data.data.slice().reverse().map(k => ({
         openTime: Number(k[0]),
         open: num(k[1]),
         high: num(k[2]),
@@ -206,10 +215,79 @@ async function fetchKlines(interval = '1m', limit = 120) {
         volume: num(k[5]),
         closeTime: Number(k[0]) + 60000
       }));
-    } catch (e2) {
-      throw new Error(`market_data: ${err.message}`);
     }
+    errors.push('okx: empty');
+  } catch (e) {
+    errors.push(`okx: ${e.message}`);
   }
+
+  // 2) KuCoin
+  try {
+    const sym = SYMBOL.replace('USDT', '-USDT');
+    const type = mapIntervalKucoin(interval);
+    const url = `https://api.kucoin.com/api/v1/market/candles?type=${type}&symbol=${sym}`;
+    const { data } = await axios.get(url, { timeout: 10000, headers });
+    if (data?.code === '200000' && Array.isArray(data.data) && data.data.length) {
+      // KuCoin: [time, open, close, high, low, volume, turnover] — mais recente primeiro
+      const rows = data.data.slice(0, limit).reverse();
+      return rows.map(k => ({
+        openTime: Number(k[0]) * (String(k[0]).length === 10 ? 1000 : 1),
+        open: num(k[1]),
+        high: num(k[3]),
+        low: num(k[4]),
+        close: num(k[2]),
+        volume: num(k[5]),
+        closeTime: Number(k[0]) * (String(k[0]).length === 10 ? 1000 : 1) + 60000
+      }));
+    }
+    errors.push('kucoin: empty');
+  } catch (e) {
+    errors.push(`kucoin: ${e.message}`);
+  }
+
+  // 3) Bybit
+  try {
+    const bybitInterval = mapIntervalBybit(interval);
+    const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${SYMBOL}&interval=${bybitInterval}&limit=${limit}`;
+    const { data } = await axios.get(url, { timeout: 10000, headers });
+    const list = data?.result?.list || [];
+    if (list.length) {
+      return list.slice().reverse().map(k => ({
+        openTime: Number(k[0]),
+        open: num(k[1]),
+        high: num(k[2]),
+        low: num(k[3]),
+        close: num(k[4]),
+        volume: num(k[5]),
+        closeTime: Number(k[0]) + 60000
+      }));
+    }
+    errors.push('bybit: empty');
+  } catch (e) {
+    errors.push(`bybit: ${e.message}`);
+  }
+
+  // 4) Binance (último recurso)
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${interval}&limit=${limit}`;
+    const { data } = await axios.get(url, { timeout: 10000, headers });
+    if (Array.isArray(data) && data.length) {
+      return data.map(k => ({
+        openTime: Number(k[0]),
+        open: num(k[1]),
+        high: num(k[2]),
+        low: num(k[3]),
+        close: num(k[4]),
+        volume: num(k[5]),
+        closeTime: Number(k[6])
+      }));
+    }
+    errors.push('binance: empty');
+  } catch (e) {
+    errors.push(`binance: ${e.message}`);
+  }
+
+  throw new Error(`market_data: todas as fontes falharam → ${errors.join(' | ')}`);
 }
 
 // ─── Indicadores técnicos ──────────────────────────────────────────────────
