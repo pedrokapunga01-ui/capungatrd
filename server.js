@@ -151,6 +151,23 @@ async function initDB() {
   await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS sl_pct NUMERIC`);
   await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS gale_preco NUMERIC`);
   await pool.query(`ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS ref_em TIMESTAMPTZ`);
+  // Tabela legada (v1/Bac Bo) pode ter colunas NOT NULL antigas, ex.: confluencia → deixa de bloquear o INSERT
+  await pool.query(`
+    DO $$
+    DECLARE r RECORD;
+    BEGIN
+      FOR r IN
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'trade_sinais'
+          AND is_nullable = 'NO'
+          AND column_default IS NULL
+          AND column_name NOT IN ('id','symbol','direcao','preco_entrada')
+      LOOP
+        EXECUTE format('ALTER TABLE trade_sinais ALTER COLUMN %I DROP NOT NULL', r.column_name);
+      END LOOP;
+    END $$;
+  `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_ts_estado ON trade_sinais (estado, id DESC)`);
 
   await pool.query(`
