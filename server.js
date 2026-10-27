@@ -89,6 +89,7 @@ let keepTimer = null;
 
 const nowISO = () => new Date().toISOString();
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const pos = (v, fb) => { const n = Number(v); return v != null && Number.isFinite(n) && n > 0 ? n : fb; };
 const num = (v, fb = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fb;
@@ -352,6 +353,17 @@ async function initDB() {
       em TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  // Limpeza: resultados falsos com saída = entrada (bug de TP/SL nulos em sinais da versão antiga)
+  const bad = await pool.query(
+    `SELECT id FROM trade_sinais
+     WHERE estado IN ('GREEN','G1','LOSS') AND preco_saida IS NOT NULL AND preco_saida = preco_entrada`
+  );
+  if (bad.rows.length) {
+    const ids = bad.rows.map(function (r) { return r.id; });
+    await pool.query(`DELETE FROM trade_eventos WHERE sinal_id = ANY($1::bigint[])`, [ids]);
+    await pool.query(`DELETE FROM trade_sinais WHERE id = ANY($1::bigint[])`, [ids]);
+    console.log('[DB] removidos ' + ids.length + ' resultados falsos: #' + ids.join(', #'));
+  }
   console.log('[DB] OK');
 }
 
@@ -658,8 +670,8 @@ async function fetchRange(startMs) {
 // Replay cronológico de um sinal pendente sobre as velas (SL tem prioridade se ambos na mesma vela)
 function replaySignal(s, candles, nowMs, px) {
   const long = s.direcao === 'COMPRA';
-  const tpP = num(s.tp_pct, TP_MIN_PCT);
-  const slP = num(s.sl_pct, SL_MIN_PCT);
+  const tpP = pos(s.tp_pct, TP_MIN_PCT);
+  const slP = pos(s.sl_pct, SL_MIN_PCT);
   let stage = Number(s.gale);
   let ref = stage ? num(s.gale_preco) : num(s.preco_entrada);
   let refMs = new Date(s.ref_em || s.criado_em).getTime();
@@ -721,8 +733,8 @@ async function resolvePending(raw1, px) {
   }
 
   const r = replaySignal(s, candles, nowMs, px);
-  const tpP = num(s.tp_pct, TP_MIN_PCT);
-  const slP = num(s.sl_pct, SL_MIN_PCT);
+  const tpP = pos(s.tp_pct, TP_MIN_PCT);
+  const slP = pos(s.sl_pct, SL_MIN_PCT);
 
   if (r.state === 'PENDENTE') {
     if (r.stage > Number(s.gale)) {
@@ -778,12 +790,46 @@ async function openSignal(a) {
   return id;
 }
 
+// ── Instância única (evita sinais/mensagens duplicados em deploys sobrepostos) ──
+
+let lockClient = null;
+let isLeader = false;
+
+async function ensureLeader() {
+  if (isLeader && lockClient) return true;
+  try {
+    if (!lockClient) {
+      const c = await pool.connect();
+      lockClient = c;
+      c.on('error', function () {
+        isLeader = false;
+        lockClient = null;
+        try { c.release(true); } catch (e) { /* ignora */ }
+      });
+    }
+    const { rows } = await lockClient.query('SELECT pg_try_advisory_lock(727301) AS ok');
+    isLeader = rows[0].ok === true;
+    if (isLeader) console.log('[LOCK] instância líder');
+    else {
+      console.log('[LOCK] outra instância ativa, em espera');
+      lockClient.release();
+      lockClient = null;
+    }
+    return isLeader;
+  } catch (e) {
+    isLeader = false;
+    if (lockClient) { try { lockClient.release(true); } catch (x) { /* ignora */ } lockClient = null; }
+    return false;
+  }
+}
+
 // ── Loop ────────────────────────────────────────────────────────────────────
 
 async function tick() {
   if (busy) return;
   busy = true;
   try {
+    if (!(await ensureLeader())) return;
     await tgCommands();
     await dailySummary();
 
@@ -1006,6 +1052,7 @@ async function main() {
   function stop() {
     if (loopTimer) clearInterval(loopTimer);
     if (keepTimer) clearInterval(keepTimer);
+    if (lockClient) { try { lockClient.release(true); } catch (e) { /* ignora */ } }
     server.close(async function () {
       try { await pool.end(); } finally { process.exit(0); }
     });
