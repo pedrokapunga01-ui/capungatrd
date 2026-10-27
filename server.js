@@ -8,6 +8,7 @@
  * - Só sinaliza com 5m + 15m alinhados com a direção + pullback + momentum
  * - TP/SL dinâmicos por ATR, resolvidos por high/low das velas (não perde picos)
  * - Gale máx. 1 (re-entrada real, com novo TP/SL)
+ * - Sem sinais expirados: ao acordar, apura GREEN/LOSS pelo histórico de velas
  * - 100% automático: loop + keep-alive (Render free) + pausa após LOSS
  * - /backtest mede a taxa de acerto REAL da estratégia nos dados recentes
  *
@@ -16,9 +17,9 @@
  *   PORT · SYMBOL (BTCUSDT) · BYBIT_CATEGORY (linear)
  *   MIN_CONFLUENCIA (75) · LOOP_MS (20000)
  *   TP_ATR (1.0) · SL_ATR (2.0) · TP_MIN_PCT (0.10) · SL_MIN_PCT (0.20)
- *   SINAL_EXPIRA_MS (1200000) · ANTI_SPAM_MS (180000) · LOSS_PAUSE_MS (900000)
+ *   SINAL_EXPIRA_MS (1200000, janela máx. antes de fechar por preço) · ANTI_SPAM_MS (180000) · LOSS_PAUSE_MS (900000)
  *   KEEPALIVE_URL (ou RENDER_EXTERNAL_URL automático no Render)
- *   DATABASE_SSL=false para desligar SSL
+ *   TIMEZONE (Africa/Luanda) · DATABASE_SSL=false para desligar SSL
  */
 
 const express = require('express');
@@ -50,6 +51,7 @@ const SINAL_EXPIRA_MS = Math.max(300000, envNum('SINAL_EXPIRA_MS', 1200000));
 const ANTI_SPAM_MS = Math.max(60000, envNum('ANTI_SPAM_MS', 180000));
 const LOSS_PAUSE_MS = Math.max(0, envNum('LOSS_PAUSE_MS', 900000));
 const MAX_GALE = 1;
+const TIMEZONE = process.env.TIMEZONE || 'Africa/Luanda';
 
 const TP_ATR = envNum('TP_ATR', 1.0);
 const SL_ATR = envNum('SL_ATR', 2.0);
@@ -121,6 +123,176 @@ async function tg(text) {
     lastError = 'tg: ' + e.message;
     console.error('[TG]', (e.response && e.response.data) || e.message);
     return false;
+  }
+}
+
+// ── Mensagens (estilo SMS), placar e histórico ──────────────────────────────
+
+const LINE = '━━━━━━━━━━━━━━';
+const fTime = (ms) => new Date(ms).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: TIMEZONE });
+const fDate = (ms) => new Date(ms).toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit', timeZone: TIMEZONE });
+const dayKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: TIMEZONE });
+const sideIcon = (side) => (side === 'COMPRA' ? '🟢' : '🔴');
+const stateIcon = (st) => ({ GREEN: '✅', G1: '🔁', LOSS: '❌', PENDENTE: '⏳', EXPIRADO: '⌛' }[st] || '•');
+const pctTxt = (v) => (v == null ? '' : (Number(v) >= 0 ? '+' : '') + Number(v).toFixed(2) + '%');
+
+// contagens: hoje (fuso configurado) ou total
+async function counts(daily) {
+  const where = daily
+    ? `WHERE criado_em >= (date_trunc('day', NOW() AT TIME ZONE $1::text) AT TIME ZONE $1::text)`
+    : `WHERE $1::text IS NOT NULL`;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE estado='GREEN')::int AS g,
+            COUNT(*) FILTER (WHERE estado='G1')::int AS g1,
+            COUNT(*) FILTER (WHERE estado='LOSS')::int AS l,
+            COUNT(*) FILTER (WHERE estado='PENDENTE')::int AS p
+     FROM trade_sinais ${where}`,
+    [TIMEZONE]
+  );
+  return rows[0] || { g: 0, g1: 0, l: 0, p: 0 };
+}
+
+function boardLine(c) {
+  const settled = c.g + c.g1 + c.l;
+  const wr = settled ? Math.round(((c.g + c.g1) * 100) / settled) + '%' : '—';
+  return '✅ ' + c.g + '  🔁 ' + c.g1 + '  ❌ ' + c.l + '  🎯 ' + wr;
+}
+
+async function historyText(limit, daily) {
+  const cond = daily
+    ? `WHERE criado_em >= (date_trunc('day', NOW() AT TIME ZONE $2::text) AT TIME ZONE $2::text)`
+    : `WHERE $2::text IS NOT NULL`;
+  const q = await pool.query(
+    `SELECT id, direcao, estado, preco_entrada, preco_saida, pnl_pct, criado_em
+     FROM trade_sinais ${cond} ORDER BY id DESC LIMIT $1`,
+    [limit, TIMEZONE]
+  );
+  const d = await counts(true);
+  const t = await counts(false);
+  const head = daily
+    ? '🌙 <b>RESUMO DO DIA · ' + fDate(Date.now()) + '</b>'
+    : '📋 <b>HISTÓRICO · CAPUNGA TRADE</b>';
+  const rows = q.rows.map(function (r) {
+    const when = fTime(new Date(r.criado_em).getTime());
+    const px = Number(r.preco_entrada);
+    const out = r.preco_saida != null ? ' → ' + fmt(r.preco_saida) : '';
+    const res = r.pnl_pct != null ? ' · ' + pctTxt(r.pnl_pct) : '';
+    return stateIcon(r.estado) + ' #' + r.id + ' ' + sideIcon(r.direcao) + ' ' + r.direcao + ' · ' + fmt(px) + out + res + ' · ' + when;
+  });
+  return [
+    head,
+    LINE,
+    '📅 Hoje   ' + boardLine(d) + (d.p ? '  ⏳ ' + d.p : ''),
+    '🏆 Total  ' + boardLine(t),
+    LINE,
+    rows.length ? rows.join('\n') : 'Ainda sem sinais.',
+    LINE,
+    '✅ GREEN  🔁 GREEN no gale  ❌ LOSS  ⏳ em aberto'
+  ].join('\n');
+}
+
+function msgSignal(a, id, tpPrice, slPrice, d) {
+  const long = a.side === 'COMPRA';
+  const arr = function (t) { return t === 'ALTA' ? '▲' : t === 'BAIXA' ? '▼' : '►'; };
+  return [
+    sideIcon(a.side) + ' <b>' + a.side + ' · ' + SYMBOL + '</b>',
+    '🏦 Bybit · Perp · ordem a mercado',
+    '🕒 ' + fDate(Date.now()) + ' · ' + fTime(Date.now()),
+    LINE,
+    '🎯 <b>Entrada</b>  <code>' + fmt(a.price) + '</code>',
+    '✅ <b>TP</b>  <code>' + fmt(tpPrice) + '</code>  (+' + a.tpPct + '% lucro)',
+    '🛑 <b>SL</b>  <code>' + fmt(slPrice) + '</code>  (-' + a.slPct + '% risco)',
+    LINE,
+    '🔁 <b>Gale 1:</b> se o SL for tocado, re-entrar ' + a.side + ' a mercado (envio novo TP/SL)',
+    '⏱ Fecho por preço até ' + fTime(Date.now() + WINDOW_MS),
+    LINE,
+    '📊 Força <b>' + a.score + '/100</b> · RSI ' + a.rsi,
+    '📈 Tendência 15m ' + arr(a.trend15) + ' · 5m ' + arr(a.trend5),
+    '🧠 ' + a.tags.slice(0, 4).join(' · '),
+    LINE,
+    '🆔 #' + id + '  📅 Hoje ' + boardLine(d)
+  ].join('\n');
+}
+
+function msgGale(s, g, tpP, slP, late) {
+  const long = s.direcao === 'COMPRA';
+  return [
+    '🔁 <b>GALE 1 · #' + s.id + '</b>',
+    '⚠️ SL tocado — re-entrar ' + sideIcon(s.direcao) + ' <b>' + s.direcao + '</b> a mercado',
+    LINE,
+    '🎯 <b>Entrada</b>  <code>' + fmt(g) + '</code>',
+    '✅ <b>TP</b>  <code>' + fmt(long ? g * (1 + tpP / 100) : g * (1 - tpP / 100)) + '</code>',
+    '🛑 <b>SL</b>  <code>' + fmt(long ? g * (1 - slP / 100) : g * (1 + slP / 100)) + '</code>',
+    LINE,
+    '⚠️ Último gale: se falhar, é LOSS.' + (late ? '\n🕒 Apurado pelo histórico (bot estava inativo)' : '')
+  ].join('\n');
+}
+
+function msgResult(s, r, d, late) {
+  const win = r.state !== 'LOSS';
+  const title = r.state === 'GREEN' ? '✅ <b>GREEN</b>' : r.state === 'G1' ? '🔁 <b>GREEN no GALE 1</b>' : '❌ <b>LOSS</b>';
+  const lines = [
+    title + ' · #' + s.id,
+    sideIcon(s.direcao) + ' ' + s.direcao + ' · ' + SYMBOL,
+    LINE,
+    '🎯 Entrada  <code>' + fmt(r.ref) + '</code>',
+    '🏁 Saída  <code>' + fmt(r.exit) + '</code>',
+    (win ? '💰 Resultado  <b>' : '📉 Resultado  <b>') + pctTxt(r.pnl) + '</b>',
+    '🕒 ' + fTime(r.at)
+  ];
+  if (r.timeout) lines.push('ℹ️ Fechado no fim da janela, a favor da entrada');
+  if (r.state === 'LOSS') lines.push('⏸ Pausa de ' + Math.round(LOSS_PAUSE_MS / 60000) + ' min nos sinais');
+  if (late) lines.push('🕒 Apurado pelo histórico (bot estava inativo)');
+  lines.push(LINE, '📅 Hoje ' + boardLine(d));
+  return lines.join('\n');
+}
+
+// ── Comandos do Telegram (/historico /placar /ajuda) ────────────────────────
+
+let tgOffset = null;
+
+async function tgCommands() {
+  if (!BOT_TOKEN || !CHAT_ID) return;
+  try {
+    const base = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`;
+    if (tgOffset === null) {
+      // primeira vez: ignora mensagens antigas
+      const first = await axios.get(base, { params: { offset: -1, timeout: 0 }, timeout: 10000 });
+      const l = (first.data && first.data.result) || [];
+      tgOffset = l.length ? l[l.length - 1].update_id + 1 : 0;
+      return;
+    }
+    const { data } = await axios.get(base, {
+      params: { offset: tgOffset, timeout: 0, allowed_updates: JSON.stringify(['message', 'channel_post']) },
+      timeout: 10000
+    });
+    for (const u of (data && data.result) || []) {
+      tgOffset = u.update_id + 1;
+      const m = u.message || u.channel_post;
+      if (!m || !m.text || !m.chat || String(m.chat.id) !== CHAT_ID) continue;
+      const cmd = m.text.trim().split(/[\s@]/)[0].toLowerCase();
+      if (cmd === '/historico' || cmd === '/histórico') await tg(await historyText(10, false));
+      else if (cmd === '/placar') {
+        const d = await counts(true);
+        const t = await counts(false);
+        await tg('📊 <b>PLACAR</b>\n' + LINE + '\n📅 Hoje   ' + boardLine(d) + '\n🏆 Total  ' + boardLine(t));
+      } else if (cmd === '/ajuda' || cmd === '/start') {
+        await tg('🤖 <b>CAPUNGA TRADE</b>\n' + LINE + '\n/historico · últimos 10 sinais\n/placar · acertos de hoje e total\n/ajuda · esta mensagem');
+      }
+    }
+  } catch (e) { /* webhook ativo ou rede: ignora */ }
+}
+
+// resumo automático no fim do dia (23:55 no fuso configurado)
+let lastSummaryDay = null;
+async function dailySummary() {
+  const now = Date.now();
+  const hm = fTime(now);
+  const today = dayKey(now);
+  if (hm >= '23:55' && lastSummaryDay !== today) {
+    lastSummaryDay = today;
+    const d = await counts(true);
+    if (d.g + d.g1 + d.l + d.p > 0) await tg(await historyText(30, true));
   }
 }
 
@@ -448,105 +620,135 @@ function analyze(c1, c5, c15) {
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
+// Sem "expirado": todo sinal fecha como GREEN / G1 / LOSS.
+// Se o bot esteve a dormir, ao acordar reconstrói o que aconteceu a partir das
+// velas de 1m desde a entrada (replay cronológico) e atualiza o histórico.
+// Fim da janela (SINAL_EXPIRA_MS) sem TP/SL: fecha pelo preço — a favor = GREEN, contra = gale/LOSS.
 
-async function expireOld() {
-  const { rows } = await pool.query(
-    `UPDATE trade_sinais
-     SET estado='EXPIRADO', resolvido_em=NOW()
-     WHERE estado='PENDENTE'
-       AND COALESCE(ref_em, criado_em) < NOW() - ($1::int * INTERVAL '1 millisecond')
-     RETURNING id, direcao, preco_entrada`,
-    [SINAL_EXPIRA_MS]
-  );
-  for (const s of rows) {
-    await logEv(s.id, 'EXPIRADO', 'timeout');
-    await tg(
-      '⏱ <b>CAPUNGA TRADE</b>\n' +
-      'Sinal #' + s.id + ' expirado sem TP/SL\n' +
-      s.direcao + ' @ ' + fmt(s.preco_entrada) + '\n' +
-      'Considere fechado, sem resultado.'
-    );
+const WINDOW_MS = SINAL_EXPIRA_MS;
+
+// Velas de 1m desde startMs até agora (paginado, 1000 por pedido)
+async function fetchRange(startMs) {
+  const endAll = Date.now();
+  let cursor = Math.max(startMs, endAll - 13 * 24 * 3600 * 1000);
+  const out = [];
+  for (let n = 0; n < 20 && cursor < endAll; n++) {
+    const end = Math.min(endAll, cursor + 1000 * 60000 - 1);
+    let list = null;
+    for (const host of BYBIT_HOSTS) {
+      try {
+        const { data } = await axios.get(
+          `${host}/v5/market/kline?category=${CATEGORY}&symbol=${SYMBOL}&interval=1&start=${cursor}&end=${end}&limit=1000`,
+          { timeout: 12000, headers: HEADERS }
+        );
+        const l = data && data.retCode === 0 && data.result && data.result.list;
+        if (l) { list = l; break; }
+      } catch (e) { /* tenta próximo host */ }
+    }
+    if (!list) return null;
+    list.forEach(function (k) {
+      out.push({ t: Number(k[0]), o: num(k[1]), h: num(k[2]), l: num(k[3]), c: num(k[4]), v: num(k[5]) });
+    });
+    cursor = end + 1;
   }
+  out.sort(function (a, b) { return a.t - b.t; });
+  return out;
+}
+
+// Replay cronológico de um sinal pendente sobre as velas (SL tem prioridade se ambos na mesma vela)
+function replaySignal(s, candles, nowMs, px) {
+  const long = s.direcao === 'COMPRA';
+  const tpP = num(s.tp_pct, TP_MIN_PCT);
+  const slP = num(s.sl_pct, SL_MIN_PCT);
+  let stage = Number(s.gale);
+  let ref = stage ? num(s.gale_preco) : num(s.preco_entrada);
+  let refMs = new Date(s.ref_em || s.criado_em).getTime();
+  let galeEntry = stage ? ref : null;
+
+  const pnlOf = function (exit) {
+    return Number(((long ? exit - ref : ref - exit) / ref * 100).toFixed(4));
+  };
+  const done = function (state, exit, at, extra) {
+    return Object.assign({
+      state: state, stage: stage, ref: ref, galeEntry: galeEntry,
+      exit: exit, pnl: pnlOf(exit), at: at
+    }, extra || {});
+  };
+
+  for (const k of candles) {
+    if (k.t < refMs) continue;
+    const endMs = k.t + 60000;
+    const closed = endMs <= nowMs;
+    const tpPrice = long ? ref * (1 + tpP / 100) : ref * (1 - tpP / 100);
+    const slPrice = long ? ref * (1 - slP / 100) : ref * (1 + slP / 100);
+    const hitSL = long ? k.l <= slPrice : k.h >= slPrice;
+    const hitTP = long ? k.h >= tpPrice : k.l <= tpPrice;
+    const at = Math.min(endMs, nowMs);
+
+    let loss = null;
+    if (hitSL) {
+      loss = { exit: slPrice, entry: closed ? k.c : px };
+    } else if (hitTP) {
+      return done(stage ? 'G1' : 'GREEN', tpPrice, at);
+    } else if (closed && endMs >= refMs + WINDOW_MS) {
+      const fav = long ? k.c > ref : k.c < ref;
+      if (fav) return done(stage ? 'G1' : 'GREEN', k.c, at, { timeout: true });
+      loss = { exit: k.c, entry: k.c };
+    }
+
+    if (loss) {
+      if (stage >= MAX_GALE) return done('LOSS', loss.exit, at);
+      stage = 1;
+      ref = loss.entry;
+      galeEntry = ref;
+      refMs = at;
+    }
+  }
+  return { state: 'PENDENTE', stage: stage, ref: ref, galeEntry: galeEntry, refMs: refMs };
 }
 
 async function resolvePending(raw1, px) {
   const s = await pendingSignal();
   if (!s) return;
 
-  const stage = Number(s.gale);
-  const long = s.direcao === 'COMPRA';
-  const ref = stage ? num(s.gale_preco) : num(s.preco_entrada);
-  const refMs = new Date(s.ref_em || s.criado_em).getTime();
+  const nowMs = Date.now();
+  const refMs0 = new Date(s.ref_em || s.criado_em).getTime();
+  let candles = raw1;
+  if (raw1.length && refMs0 < raw1[0].t) {
+    // bot esteve inativo mais que as velas já carregadas → busca o histórico em falta
+    const rng = await fetchRange(refMs0);
+    if (rng && rng.length) candles = rng;
+  }
+
+  const r = replaySignal(s, candles, nowMs, px);
   const tpP = num(s.tp_pct, TP_MIN_PCT);
   const slP = num(s.sl_pct, SL_MIN_PCT);
 
-  const tpPrice = long ? ref * (1 + tpP / 100) : ref * (1 - tpP / 100);
-  const slPrice = long ? ref * (1 - slP / 100) : ref * (1 + slP / 100);
-
-  // velas que começaram depois da entrada (+ preço atual) → apanha picos entre ticks
-  const after = raw1.filter(function (k) { return k.t >= refMs; });
-  let hi = px, lo = px;
-  after.forEach(function (k) { if (k.h > hi) hi = k.h; if (k.l < lo) lo = k.l; });
-
-  const hitSL = long ? lo <= slPrice : hi >= slPrice;
-  const hitTP = long ? hi >= tpPrice : lo <= tpPrice;
-
-  // se ambos no mesmo intervalo, assume SL primeiro (pessimista)
-  if (hitSL) {
-    if (stage < MAX_GALE) {
+  if (r.state === 'PENDENTE') {
+    if (r.stage > Number(s.gale)) {
       await pool.query(
-        `UPDATE trade_sinais SET gale=1, gale_preco=$2, ref_em=NOW() WHERE id=$1 AND estado='PENDENTE'`,
-        [s.id, px]
+        `UPDATE trade_sinais SET gale=1, gale_preco=$2, ref_em=to_timestamp($3::double precision / 1000.0)
+         WHERE id=$1 AND estado='PENDENTE'`,
+        [s.id, r.galeEntry, r.refMs]
       );
-      await logEv(s.id, 'GALE1', 'SL tocado', px);
-      await tg(
-        '🔁 <b>GALE 1 · CAPUNGA TRADE</b>\n' +
-        '----------------\n' +
-        '#' + s.id + '  re-entrar ' + s.direcao + '\n' +
-        'Entrada ' + fmt(px) + '\n' +
-        'TP ' + fmt(long ? px * (1 + tpP / 100) : px * (1 - tpP / 100)) + '\n' +
-        'SL ' + fmt(long ? px * (1 - slP / 100) : px * (1 + slP / 100)) + '\n' +
-        'Último gale — se falhar, é LOSS.'
-      );
-      return;
+      await logEv(s.id, 'GALE1', 'SL tocado', r.galeEntry);
+      await tg(msgGale(s, r.galeEntry, tpP, slP, nowMs - r.refMs > 180000));
     }
-    const pnl = Number(((long ? slPrice - ref : ref - slPrice) / ref * 100).toFixed(4));
-    await pool.query(
-      `UPDATE trade_sinais SET estado='LOSS', preco_saida=$2, pnl_pct=$3, resolvido_em=NOW()
-       WHERE id=$1 AND estado='PENDENTE'`,
-      [s.id, slPrice, pnl]
-    );
-    lastLossAt = Date.now();
-    await logEv(s.id, 'LOSS', 'max gale', slPrice);
-    await tg(
-      '❌ <b>LOSS · CAPUNGA TRADE</b>\n' +
-      '----------------\n' +
-      '#' + s.id + '  ' + s.direcao + ' (gale ' + stage + ')\n' +
-      'In  ' + fmt(ref) + '\n' +
-      'Out ' + fmt(slPrice) + '\n' +
-      'Pausa de ' + Math.round(LOSS_PAUSE_MS / 60000) + ' min nos sinais.'
-    );
     return;
   }
 
-  if (hitTP) {
-    const st = stage === 0 ? 'GREEN' : 'G1';
-    const pnl = Number(((long ? tpPrice - ref : ref - tpPrice) / ref * 100).toFixed(4));
-    await pool.query(
-      `UPDATE trade_sinais SET estado=$2, preco_saida=$3, pnl_pct=$4, resolvido_em=NOW()
-       WHERE id=$1 AND estado='PENDENTE'`,
-      [s.id, st, tpPrice, pnl]
-    );
-    await logEv(s.id, 'FECHO', st, tpPrice);
-    await tg(
-      '✅ <b>' + (st === 'G1' ? 'GREEN G1' : 'GREEN') + ' · CAPUNGA TRADE</b>\n' +
-      '----------------\n' +
-      '#' + s.id + '  ' + s.direcao + '\n' +
-      'In  ' + fmt(ref) + '\n' +
-      'Out ' + fmt(tpPrice) + '\n' +
-      'PnL +' + pnl.toFixed(3) + '%'
-    );
-  }
+  await pool.query(
+    `UPDATE trade_sinais
+     SET estado=$2, gale=$3, gale_preco=$4, preco_saida=$5, pnl_pct=$6,
+         resolvido_em=to_timestamp($7::double precision / 1000.0)
+     WHERE id=$1 AND estado='PENDENTE'`,
+    [s.id, r.state, r.stage, r.galeEntry, r.exit, r.pnl, r.at]
+  );
+  await logEv(s.id, 'FECHO', r.state + (r.timeout ? ' (fim da janela)' : ''), r.exit);
+  if (r.state === 'LOSS') lastLossAt = r.at;
+
+  const d = await counts(true);
+  await tg(msgResult(s, r, d, nowMs - r.at > 180000));
 }
 
 async function openSignal(a) {
@@ -570,19 +772,8 @@ async function openSignal(a) {
   signalsSent += 1;
   await logEv(id, 'ENTRADA', a.side, a.price);
 
-  await tg(
-    (long ? '🟢' : '🔴') + ' <b>CAPUNGA TRADE · ' + a.side + '</b>\n' +
-    '----------------\n' +
-    'Bybit · ' + SYMBOL + ' · #' + id + '\n' +
-    'Entrada ' + fmt(a.price) + '\n' +
-    'TP ' + fmt(tpPrice) + '  (+' + a.tpPct + '%)\n' +
-    'SL ' + fmt(slPrice) + '  (-' + a.slPct + '%)\n' +
-    'Score ' + a.score + '/100 · RSI ' + a.rsi + '\n' +
-    'Gale max ' + MAX_GALE + ' (se bater SL)\n' +
-    '----------------\n' +
-    a.tags.slice(0, 5).map(function (t) { return '- ' + t; }).join('\n') +
-    '\n\nSinal experimental · risco de perda'
-  );
+  const d = await counts(true);
+  await tg(msgSignal(a, id, tpPrice, slPrice, d));
   console.log('[SINAL] #' + id + ' ' + a.side + ' @ ' + a.price + ' score=' + a.score);
   return id;
 }
@@ -593,7 +784,8 @@ async function tick() {
   if (busy) return;
   busy = true;
   try {
-    await expireOld();
+    await tgCommands();
+    await dailySummary();
 
     const res = await Promise.all([
       fetchKlines('1m', 200),
@@ -629,22 +821,29 @@ async function tick() {
 function simulate(k1, i, side, price, atrPct) {
   const long = side === 'COMPRA';
   const lv = levels(atrPct);
-  const maxJ = Math.min(k1.length - 1, i + Math.ceil(SINAL_EXPIRA_MS / 60000));
+  const W = Math.ceil(WINDOW_MS / 60000);
   let ref = price;
   let stage = 0;
-  for (let j = i + 1; j <= maxJ; j++) {
+  let startJ = i;
+  for (let j = i + 1; j < k1.length; j++) {
     const k = k1[j];
     const sl = long ? ref * (1 - lv.sl / 100) : ref * (1 + lv.sl / 100);
     const tp = long ? ref * (1 + lv.tp / 100) : ref * (1 - lv.tp / 100);
     const hitSL = long ? k.l <= sl : k.h >= sl;
     const hitTP = long ? k.h >= tp : k.l <= tp;
-    if (hitSL) {
-      if (stage === 0) { stage = 1; ref = k.c; continue; }
-      return { res: 'LOSS', end: j };
+    let lost = false;
+    if (hitSL) lost = true;
+    else if (hitTP) return { res: stage ? 'G1' : 'GREEN', end: j };
+    else if (j - startJ >= W) {
+      if (long ? k.c > ref : k.c < ref) return { res: stage ? 'G1' : 'GREEN', end: j };
+      lost = true;
     }
-    if (hitTP) return { res: stage ? 'G1' : 'GREEN', end: j };
+    if (lost) {
+      if (stage === 0) { stage = 1; ref = k.c; startJ = j; }
+      else return { res: 'LOSS', end: j };
+    }
   }
-  return { res: 'EXP', end: maxJ };
+  return { res: 'ABERTO', end: k1.length };
 }
 
 async function backtest() {
@@ -657,7 +856,7 @@ async function backtest() {
   const k5 = res[1];
   const k15 = res[2];
 
-  const out = { GREEN: 0, G1: 0, LOSS: 0, EXP: 0 };
+  const out = { GREEN: 0, G1: 0, LOSS: 0, ABERTO: 0 };
   let signals = 0;
   let i = 120;
   while (i < k1.length - 2) {
