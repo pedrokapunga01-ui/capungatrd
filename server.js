@@ -4,456 +4,1021 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
+
 const app = express();
 app.disable('x-powered-by');
 app.use(cors());
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '64kb' }));
+
+/* ============================ UTIL ============================ */
 function numEnv(name, fallback, min, max) {
-const n = Number(process.env[name] ?? fallback);
-return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  const n = Number(process.env[name] ?? fallback);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 }
-function round(n, places = 2) { const p = 10 ** places; return Math.round((Number(n) + Number.EPSILON) * p) / p; }
+function boolEnv(name, def = false) {
+  return String(process.env[name] ?? def).toLowerCase() === 'true';
+}
+function round(n, places = 2) {
+  const p = 10 ** places;
+  return Math.round((Number(n) + Number.EPSILON) * p) / p;
+}
 function errText(e) { return String(e?.message || e || 'Unknown error').slice(0, 400); }
+
+/* ============================ CONFIG ============================ */
 const CFG = Object.freeze({
-port: numEnv('PORT', 3000, 1, 65535),
-symbol: String(process.env.SYMBOL || 'BTCUSDT').toUpperCase(),
-category: 'spot',
-bybitUrl: (process.env.BYBIT_BASE_URL || 'https://api.bybit.com').replace(/\/$/, ''),
-loopMs: numEnv('LOOP_MS', 60000, 15000, 3600000),
-minScore: numEnv('MIN_SCORE', 5, 3, 8),
-minRR: numEnv('MIN_RR', 1.4, 1, 5),
-riskPct: numEnv('RISK_PCT', 1, 0.1, 1) / 100,
-maxDeviationPct: numEnv('MAX_ENTRY_DEVIATION_PCT', 0.35, 0.05, 3) / 100,
-tpAtr: numEnv('ATR_TP_MULT', 1.8, 0.5, 10),
-slAtr: numEnv('ATR_SL_MULT', 1.2, 0.5, 10),
-tpMinPct: numEnv('TP_MIN_PCT', 0.25, 0.05, 5) / 100,
-slMinPct: numEnv('SL_MIN_PCT', 0.20, 0.05, 5) / 100,
-expiryMs: numEnv('SIGNAL_EXPIRY_MIN', 240, 15, 10080) * 60000,
-antiSpamMs: numEnv('ANTI_SPAM_MIN', 60, 1, 1440) * 60000,
-candleLimit: numEnv('CANDLE_LIMIT', 200, 100, 1000),
-apiKey: process.env.API_KEY || '',
-botToken: process.env.BOT_TOKEN || '',
-chatId: process.env.CHAT_ID || '',
-keepaliveUrl: process.env.KEEPALIVE_URL || '',
-databaseUrl: process.env.DATABASE_URL || '',
-databaseSsl: String(process.env.DATABASE_SSL || 'true').toLowerCase() !== 'false',
-telegramPollMs: numEnv('TELEGRAM_POLL_MS', 4000, 1500, 30000),
-allowTelegramCommands: String(process.env.TELEGRAM_COMMANDS || 'true').toLowerCase() !== 'false'
+  port: numEnv('PORT', 3000, 1, 65535),
+  apiKey: process.env.API_KEY || '',
+  webhookSecret: process.env.WEBHOOK_SECRET || '',
+
+  botToken: process.env.BOT_TOKEN || '',
+  chatId: process.env.CHAT_ID || '',
+  telegramPollMs: numEnv('TELEGRAM_POLL_MS', 4000, 1500, 30000),
+  allowTelegramCommands: boolEnv('TELEGRAM_COMMANDS', true),
+
+  keepaliveUrl: process.env.KEEPALIVE_URL || '',
+  databaseUrl: process.env.DATABASE_URL || '',
+  databaseSsl: boolEnv('DATABASE_SSL', true),
+
+  minConfidence: numEnv('MIN_CONFIDENCE', 65, 50, 99),
+  minSamples: numEnv('MIN_SAMPLES', 15, 5, 100),
+  signalExpirySec: numEnv('SIGNAL_EXPIRY_SEC', 120, 20, 600),
+  antiSpamSec: numEnv('ANTI_SPAM_SEC', 15, 5, 300),
+  historyLimit: numEnv('HISTORY_LIMIT', 500, 50, 5000),
+  martingaleMax: numEnv('MARTINGALE_MAX_LEVEL', 4, 0, 10),
+  baseUnit: numEnv('BASE_UNIT', 1, 0.1, 1000),
+  allowDrawSignals: boolEnv('ALLOW_DRAW_SIGNALS', false),
+  strategies: {
+    streak: boolEnv('STRAT_STREAK', true),
+    trend: boolEnv('STRAT_TREND', true),
+    pattern: boolEnv('STRAT_PATTERN', true),
+    momentum: boolEnv('STRAT_MOMENTUM', true)
+  },
+
+  // ===== DATA SOURCES (ordem = prioridade) =====
+  sourcePriority: String(process.env.SOURCE_PRIORITY || 'casinoscores,tracksino,generic')
+    .split(',').map(s => s.trim()).filter(Boolean),
+  sourcePollMs: numEnv('SOURCE_POLL_MS', 15000, 5000, 120000),
+
+  casinoscoresUrl: process.env.CASINOSCORES_URL
+    || 'https://api.casinoscores.com/svc-evolution-game-events/api/footballstudio',
+  casinoscoresTableId: process.env.CASINOSCORES_TABLE_ID || 'FootballStudio00000001',
+
+  tracksinoUrl: process.env.TRACKSINO_URL
+    || 'https://www.tracksino.com/api/v1/games/evolution/football-studio/latest',
+  tracksinoToken: process.env.TRACKSINO_TOKEN || '',
+
+  genericApiUrl: process.env.GENERIC_API_URL || '',
+  genericApiKey: process.env.GENERIC_API_KEY || ''
 });
+
+/* ============================ DB ============================ */
 const pool = CFG.databaseUrl ? new Pool({
-connectionString: CFG.databaseUrl,
-ssl: CFG.databaseSsl ? { rejectUnauthorized: false } : false,
-max: 8,
-idleTimeoutMillis: 30000,
-connectionTimeoutMillis: 10000
+  connectionString: CFG.databaseUrl,
+  ssl: CFG.databaseSsl ? { rejectUnauthorized: false } : false,
+  max: 8, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000
 }) : null;
+
+/* ============================ STATE ============================ */
 let server;
-let scanTimer;
-let keepaliveTimer;
-let telegramTimer;
-let scanning = false;
+let keepaliveTimer, telegramTimer, sourceTimer;
 let shuttingDown = false;
-let lastAnalysis = null;
+let scanning = false;
+let polling = false;
 let lastError = null;
-let lastSource = 'none';
-let lastSignalAt = 0;
 let telegramOffset = 0;
-let consecutiveErrors = 0;
-async function logEvent(type, message, data = {}) {
-if (!pool) return;
-try {
-await pool.query('INSERT INTO trade_eventos(tipo,mensagem,dados) VALUES($1,$2,$3)', [type, message, JSON.stringify(data)]);
-} catch (e) { console.error('[DB event]', errText(e)); }
+const sourceHealth = {};
+
+/* ============================ LOG ============================ */
+async function logEvent(tipo, mensagem, dados = {}) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      'INSERT INTO football_eventos(tipo,mensagem,dados) VALUES($1,$2,$3)',
+      [tipo, mensagem, JSON.stringify(dados)]
+    );
+  } catch (e) { console.error('[DB event]', errText(e)); }
 }
+
+/* ============================ DB INIT ============================ */
 async function initDB() {
-if (!pool) throw new Error('DATABASE_URL não configurado. PostgreSQL é obrigatório para histórico e controlo de duplicados.');
-await pool.query(`
-CREATE TABLE IF NOT EXISTS trade_sinais (
-id BIGSERIAL PRIMARY KEY,
-symbol TEXT NOT NULL,
-direcao TEXT NOT NULL DEFAULT 'BUY',
-preco_entrada NUMERIC NOT NULL,
-preco_tp NUMERIC NOT NULL,
-preco_sl NUMERIC NOT NULL,
-score INTEGER NOT NULL,
-estado TEXT NOT NULL DEFAULT 'PENDENTE',
-tp_pct NUMERIC NOT NULL,
-sl_pct NUMERIC NOT NULL,
-preco_saida NUMERIC,
-pnl_pct NUMERIC,
-criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-resolvido_em TIMESTAMPTZ,
-expiracao_em TIMESTAMPTZ NOT NULL,
-metadados JSONB NOT NULL DEFAULT '{}'::jsonb
-);
-CREATE INDEX IF NOT EXISTS trade_sinais_estado_idx ON trade_sinais(estado, criado_em DESC);
-CREATE INDEX IF NOT EXISTS trade_sinais_criado_idx ON trade_sinais(criado_em DESC);
-CREATE TABLE IF NOT EXISTS trade_eventos (
-id BIGSERIAL PRIMARY KEY,
-tipo TEXT NOT NULL,
-mensagem TEXT NOT NULL,
-dados JSONB NOT NULL DEFAULT '{}'::jsonb,
-criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS trade_config (
-chave TEXT PRIMARY KEY,
-valor TEXT NOT NULL,
-atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-`);
-// Safe migrations for databases created by earlier versions.
-await pool.query(`
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_tp NUMERIC;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_sl NUMERIC;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS tp_pct NUMERIC;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS sl_pct NUMERIC;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_saida NUMERIC;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS expiracao_em TIMESTAMPTZ;
-ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS metadados JSONB NOT NULL DEFAULT '{}'::jsonb;
-`);
-// Existing legacy rows may not have an expiry; expire them conservatively.
-await pool.query(`UPDATE trade_sinais SET expiracao_em = COALESCE(expiracao_em, criado_em + INTERVAL '4 hours') WHERE expiracao_em IS N
-const { rows } = await pool.query("SELECT EXTRACT(EPOCH FROM MAX(criado_em))*1000 AS last_ms FROM trade_sinais");
-lastSignalAt = Number(rows[0]?.last_ms || 0);
+  if (!pool) throw new Error('DATABASE_URL é obrigatório.');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS football_resultados (
+      id BIGSERIAL PRIMARY KEY,
+      round_id TEXT,
+      home_card TEXT NOT NULL,
+      away_card TEXT NOT NULL,
+      resultado TEXT NOT NULL,
+      hash TEXT,
+      origem TEXT NOT NULL DEFAULT 'webhook',
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS football_resultados_round_idx
+      ON football_resultados(round_id) WHERE round_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS football_resultados_created_idx
+      ON football_resultados(criado_em DESC);
+
+    CREATE TABLE IF NOT EXISTS football_sinais (
+      id BIGSERIAL PRIMARY KEY,
+      direcao TEXT NOT NULL,
+      confianca INTEGER NOT NULL,
+      estado TEXT NOT NULL DEFAULT 'PENDENTE',
+      martingale_nivel INTEGER NOT NULL DEFAULT 0,
+      stake_sugerida NUMERIC NOT NULL,
+      estrategias TEXT[] NOT NULL DEFAULT '{}',
+      resultado_id BIGINT,
+      resultado_final TEXT,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolvido_em TIMESTAMPTZ,
+      expiracao_em TIMESTAMPTZ NOT NULL,
+      metadados JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS football_sinais_estado_idx
+      ON football_sinais(estado, criado_em DESC);
+    CREATE INDEX IF NOT EXISTS football_sinais_criado_idx
+      ON football_sinais(criado_em DESC);
+
+    CREATE TABLE IF NOT EXISTS football_eventos (
+      id BIGSERIAL PRIMARY KEY,
+      tipo TEXT NOT NULL,
+      mensagem TEXT NOT NULL,
+      dados JSONB NOT NULL DEFAULT '{}'::jsonb,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS football_eventos_created_idx
+      ON football_eventos(criado_em DESC);
+
+    CREATE TABLE IF NOT EXISTS football_config (
+      chave TEXT PRIMARY KEY,
+      valor TEXT NOT NULL,
+      atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`INSERT INTO football_config(chave,valor)
+    VALUES('martingale_nivel','0')
+    ON CONFLICT(chave) DO NOTHING`);
 }
+
+/* ============================ MARTINGALE ============================ */
+async function getMartingaleLevel() {
+  const { rows } = await pool.query(
+    "SELECT valor FROM football_config WHERE chave='martingale_nivel'"
+  );
+  return Number(rows[0]?.valor || 0);
+}
+async function setMartingaleLevel(level) {
+  await pool.query(
+    `INSERT INTO football_config(chave,valor,atualizado_em)
+     VALUES('martingale_nivel',$1,NOW())
+     ON CONFLICT(chave) DO UPDATE SET valor=EXCLUDED.valor, atualizado_em=NOW()`,
+    [String(level)]
+  );
+}
+function stakeForLevel(level) {
+  return round(CFG.baseUnit * Math.pow(2, level), 2);
+}
+
+/* ============================ TELEGRAM ============================ */
 async function telegramSend(text) {
-if (!CFG.botToken || !CFG.chatId) return { skipped: true, reason: 'Telegram not configured' };
-try {
-const { data } = await axios.post(`https://api.telegram.org/bot${CFG.botToken}/sendMessage`, {
-chat_id: CFG.chatId, text, disable_web_page_preview: true
-}, { timeout: 12000 });
-if (!data?.ok) throw new Error(data?.description || 'Telegram API rejected message');
-return { sent: true };
-} catch (e) {
-await logEvent('telegram_error', errText(e));
-console.error('[Telegram send]', errText(e));
-return { sent: false, error: errText(e) };
+  if (!CFG.botToken || !CFG.chatId) return { skipped: true };
+  try {
+    const { data } = await axios.post(
+      `https://api.telegram.org/bot${CFG.botToken}/sendMessage`,
+      { chat_id: CFG.chatId, text, disable_web_page_preview: true },
+      { timeout: 12000 }
+    );
+    if (!data?.ok) throw new Error(data?.description || 'Telegram rejected');
+    return { sent: true };
+  } catch (e) {
+    await logEvent('telegram_error', errText(e));
+    console.error('[TG]', errText(e));
+    return { sent: false, error: errText(e) };
+  }
 }
+
+/* ============================ ANÁLISE ============================ */
+// history: array de { resultado: 'HOME'|'AWAY'|'DRAW' } MAIS RECENTE PRIMEIRO.
+
+function streakSignal(history) {
+  if (history.length < 3) return null;
+  const last = history[0].resultado;
+  if (last === 'DRAW') return null;
+  let streak = 0;
+  for (const h of history) {
+    if (h.resultado === last) streak++;
+    else break;
+  }
+  if (streak >= 5) {
+    const dir = last === 'HOME' ? 'AWAY' : 'HOME';
+    return {
+      direction: dir,
+      confidence: Math.min(85, 60 + (streak - 5) * 6),
+      strategy: 'reversal',
+      detail: `Reversão após ${streak}× ${last}`
+    };
+  }
+  if (streak >= 3) {
+    return {
+      direction: last,
+      confidence: Math.min(78, 55 + (streak - 3) * 6),
+      strategy: 'streak',
+      detail: `${streak}× ${last} consecutivos (follow)`
+    };
+  }
+  return null;
 }
-async function fetchBybitCandles(interval) {
-const { data } = await axios.get(`${CFG.bybitUrl}/v5/market/kline`, {
-params: { category: 'spot', symbol: CFG.symbol, interval: String(interval), limit: CFG.candleLimit }, timeout: 12000
-});
-if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) throw new Error(`Bybit kline: ${data?.retMsg || 'resposta inválida'}`);
-const ms = Number(interval) * 60000;
-return data.result.list.map(r => ({ time: Number(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]),
-.filter(c => [c.time,c.open,c.high,c.low,c.close,c.volume].every(Number.isFinite) && c.close > 0)
-.sort((a,b) => a.time - b.time).filter(c => c.time + ms <= Date.now());
+
+function trendSignal(history) {
+  if (history.length < 10) return null;
+  const recent = history.slice(0, 20);
+  const home = recent.filter(h => h.resultado === 'HOME').length;
+  const away = recent.filter(h => h.resultado === 'AWAY').length;
+  const total = home + away;
+  if (total < 10) return null;
+  const bias = Math.max(home, away) / total;
+  if (bias < 0.63) return null;
+  const dir = home > away ? 'HOME' : 'AWAY';
+  return {
+    direction: dir,
+    confidence: Math.min(80, 55 + (bias - 0.63) * 100),
+    strategy: 'trend',
+    detail: `${round(bias * 100, 1)}% ${dir} em ${total} rodadas`
+  };
 }
-async function fetchOkxCandles(interval) {
-const instId = CFG.symbol.replace(/USDT$/, '-USDT');
-const { data } = await axios.get('https://www.okx.com/api/v5/market/candles', {
-params: { instId, bar: `${interval}m`, limit: String(Math.min(CFG.candleLimit, 300)) }, timeout: 12000
-});
-if (data?.code !== '0' || !Array.isArray(data?.data)) throw new Error('OKX candles response invalid');
-const ms = Number(interval) * 60000;
-return data.data.map(r => ({ time: Number(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]), volume
-.filter(c => [c.time,c.open,c.high,c.low,c.close,c.volume].every(Number.isFinite) && c.close > 0)
-.sort((a,b) => a.time - b.time).filter(c => c.time + ms <= Date.now());
+
+function patternSignal(history) {
+  if (history.length < 40) return null;
+  const patLen = 3;
+  const current = history.slice(0, patLen).map(h => h.resultado).join('|');
+  const after = { HOME: 0, AWAY: 0, DRAW: 0 };
+  for (let i = patLen + 1; i < history.length - patLen; i++) {
+    const seq = history.slice(i, i + patLen).map(h => h.resultado).join('|');
+    if (seq === current) after[history[i - 1].resultado]++;
+  }
+  const total = after.HOME + after.AWAY + after.DRAW;
+  if (total < 6) return null;
+  let best = 'HOME';
+  for (const d of ['AWAY', 'DRAW']) if (after[d] > after[best]) best = d;
+  const rate = after[best] / total;
+  if (rate < 0.55) return null;
+  if (best === 'DRAW' && !CFG.allowDrawSignals) return null;
+  return {
+    direction: best,
+    confidence: Math.min(82, 50 + rate * 45),
+    strategy: 'pattern',
+    detail: `Padrão ${current.replace(/\|/g, '-')} → ${best} (${after[best]}/${total})`
+  };
 }
-async function fetchMarketBundle() {
-// Fetch all timeframes from the same exchange to avoid mixing market sources.
-try {
-const [m1,m5,m15] = await Promise.all([fetchBybitCandles(1),fetchBybitCandles(5),fetchBybitCandles(15)]);
-if ([m1,m5,m15].some(a => a.length < 60)) throw new Error('Bybit returned insufficient closed candles');
-lastSource = 'bybit-spot';
-return { m1,m5,m15,source:lastSource };
-} catch (bybitError) {
-try {
-const [m1,m5,m15] = await Promise.all([fetchOkxCandles(1),fetchOkxCandles(5),fetchOkxCandles(15)]);
-if ([m1,m5,m15].some(a => a.length < 60)) throw new Error('OKX returned insufficient closed candles');
-lastSource = 'okx-spot-fallback';
-return { m1,m5,m15,source:lastSource };
-} catch (okxError) {
-throw new Error(`Market data unavailable. Bybit: ${errText(bybitError)}; OKX: ${errText(okxError)}`);
+
+function momentumSignal(history) {
+  if (history.length < 10) return null;
+  const last5 = history.slice(0, 5);
+  const prev5 = history.slice(5, 10);
+  const lh = last5.filter(h => h.resultado === 'HOME').length;
+  const la = last5.filter(h => h.resultado === 'AWAY').length;
+  const ph = prev5.filter(h => h.resultado === 'HOME').length;
+  const pa = prev5.filter(h => h.resultado === 'AWAY').length;
+  const deltaHome = lh - ph;
+  const deltaAway = la - pa;
+  if (deltaHome >= 2) {
+    return {
+      direction: 'HOME',
+      confidence: Math.min(76, 55 + deltaHome * 5),
+      strategy: 'momentum',
+      detail: `Momentum HOME ↑ (${lh} vs ${ph})`
+    };
+  }
+  if (deltaAway >= 2) {
+    return {
+      direction: 'AWAY',
+      confidence: Math.min(76, 55 + deltaAway * 5),
+      strategy: 'momentum',
+      detail: `Momentum AWAY ↑ (${la} vs ${pa})`
+    };
+  }
+  return null;
 }
+
+function combineSignals(history) {
+  const raw = [];
+  if (CFG.strategies.streak)   { const s = streakSignal(history);   if (s) raw.push(s); }
+  if (CFG.strategies.trend)    { const s = trendSignal(history);    if (s) raw.push(s); }
+  if (CFG.strategies.pattern)  { const s = patternSignal(history);  if (s) raw.push(s); }
+  if (CFG.strategies.momentum) { const s = momentumSignal(history); if (s) raw.push(s); }
+
+  if (!raw.length) return { direction: null, confidence: 0, reasons: ['Sem padrão detectado'], strategies: [] };
+
+  const groups = { HOME: [], AWAY: [], DRAW: [] };
+  for (const s of raw) groups[s.direction].push(s);
+
+  let best = null;
+  for (const dir of ['HOME', 'AWAY', 'DRAW']) {
+    const g = groups[dir];
+    if (!g.length) continue;
+    const baseAvg = g.reduce((a, s) => a + s.confidence, 0) / g.length;
+    const agreementBoost = Math.max(0, g.length - 1) * 6;
+    const finalConf = Math.min(95, baseAvg + agreementBoost);
+    if (!best || finalConf > best.confidence) {
+      best = {
+        direction: dir,
+        confidence: Math.round(finalConf),
+        strategies: g.map(s => s.strategy),
+        reasons: g.map(s => `${s.strategy}: ${s.detail}`)
+      };
+    }
+  }
+  return best;
 }
-}
-async function fetchPrice(source = 'bybit-spot') {
-if (source === 'okx-spot-fallback') {
-const instId = CFG.symbol.replace(/USDT$/, '-USDT');
-const { data } = await axios.get('https://www.okx.com/api/v5/market/ticker', { params: { instId }, timeout: 10000 });
-const p = Number(data?.data?.[0]?.last);
-if (data?.code !== '0' || !Number.isFinite(p) || p <= 0) throw new Error('OKX ticker unavailable');
-return p;
-}
-const { data } = await axios.get(`${CFG.bybitUrl}/v5/market/tickers`, { params: { category:'spot', symbol:CFG.symbol }, timeout:10000 }
-const p = Number(data?.result?.list?.[0]?.lastPrice);
-if (data?.retCode !== 0 || !Number.isFinite(p) || p <= 0) throw new Error('Bybit ticker unavailable');
-return p;
-}
-function ema(values, period) {
-if (values.length < period) return null;
-const k = 2 / (period + 1);
-let v = values.slice(0, period).reduce((a,b) => a+b, 0) / period;
-for (let i=period; i<values.length; i++) v = values[i]*k + v*(1-k);
-return v;
-}
-function rsi(values, period=14) {
-if (values.length < period+1) return null;
-let gains=0, losses=0;
-for (let i=values.length-period; i<values.length; i++) { const d=values[i]-values[i-1]; if (d>0) gains+=d; else losses-=d; }
-if (losses===0) return gains===0 ? 50 : 100;
-const rs=(gains/period)/(losses/period); return 100-(100/(1+rs));
-}
-function atr(candles, period=14) {
-if (candles.length < period+1) return null;
-const tr=[];
-for (let i=1; i<candles.length; i++) { const c=candles[i], pc=candles[i-1].close; tr.push(Math.max(c.high-c.low,Math.abs(c.high-pc),Mat
-return tr.slice(-period).reduce((a,b)=>a+b,0)/period;
-}
-function adxApprox(candles, period=14) {
-if (candles.length < period+2) return null;
-let plus=0,minus=0,tr=0;
-for(let i=candles.length-period;i<candles.length;i++) { const c=candles[i],p=candles[i-1]; const up=c.high-p.high,down=p.low-c.low; plu
-if(tr<=0) return 0; const pdi=100*plus/tr,mdi=100*minus/tr; return pdi+mdi===0?0:100*Math.abs(pdi-mdi)/(pdi+mdi);
-}
-function getFeatures(candles) {
-const closes=candles.map(c=>c.close), last=candles[candles.length-1];
-return { close:last.close, ema9:ema(closes,9), ema21:ema(closes,21), ema50:ema(closes,50), rsi:rsi(closes), atr:atr(candles), adx:adxAp
-}
-function analyze(m1,m5,m15) {
-const a=getFeatures(m1), b=getFeatures(m5), c=getFeatures(m15);
-const reasons=[]; let score=0;
-if (b.ema9>b.ema21) { score++; reasons.push('EMA9 acima da EMA21 em 5m'); }
-if (c.ema9>c.ema21 && c.ema21>c.ema50) { score+=2; reasons.push('Tendência ascendente confirmada em 15m'); }
-if (b.rsi>=50 && b.rsi<=68) { score++; reasons.push('RSI de 5m em zona favorável'); }
-if (b.close>b.ema9 && b.ema9>b.ema21) { score++; reasons.push('Preço acima das médias curtas'); }
-if (b.adx>=18) { score++; reasons.push('Força de tendência suficiente'); }
-if (a.close>a.ema9 && a.ema9>a.ema21) { score++; reasons.push('Confirmação de momentum em 1m'); }
-if (b.rsi>72) { score-=2; reasons.push('Penalização por RSI sobrecomprado'); }
-if (c.ema9<c.ema21) { score-=2; reasons.push('Tendência de 15m não confirma compra'); }
-if (!Number.isFinite(b.atr) || b.atr<=0 || !Number.isFinite(b.close)) return { ok:false, score, reasons:['Indicadores insuficientes'],
-const entry=b.close;
-const slDist=Math.max(b.atr*CFG.slAtr,entry*CFG.slMinPct);
-const tpDist=Math.max(b.atr*CFG.tpAtr,entry*CFG.tpMinPct);
-const rr=tpDist/slDist;
-const ok=score>=CFG.minScore && rr>=CFG.minRR && entry>0;
-return { ok, direction:'BUY', score, entry, tp:entry+tpDist, sl:entry-slDist, tpPct:tpDist/entry*100, slPct:slDist/entry*100, rr, reaso
-features:{m1:{close:a.close,ema9:a.ema9,ema21:a.ema21},m5:{close:b.close,ema9:b.ema9,ema21:b.ema21,rsi:b.rsi,atr:b.atr,adx:b.adx},m15
-}
+
+/* ============================ SIGNAL FLOW ============================ */
 async function pendingSignal(client = pool) {
-const { rows } = await client.query("SELECT * FROM trade_sinais WHERE estado='PENDENTE' ORDER BY id DESC LIMIT 1");
-return rows[0] || null;
+  const { rows } = await client.query(
+    "SELECT * FROM football_sinais WHERE estado='PENDENTE' ORDER BY id DESC LIMIT 1"
+  );
+  return rows[0] || null;
 }
-async function resolvePending(price, candles5m) {
-const signal = await pendingSignal();
-if (!signal) return;
-const createdAt = new Date(signal.criado_em).getTime();
-const expiresAt = new Date(signal.expiracao_em).getTime();
-const sl = Number(signal.preco_sl);
-const tp = Number(signal.preco_tp);
-const entry = Number(signal.preco_entrada);
-if (![createdAt, expiresAt, sl, tp, entry].every(Number.isFinite)) {
-await logEvent('signal_data_error', 'Sinal pendente tem dados inválidos', { id: signal.id });
-return;
+
+async function resolvePendingByResult(resultado) {
+  const sig = await pendingSignal();
+  if (!sig) return null;
+  const isGreen = sig.direcao === resultado;
+  const novoEstado = isGreen ? 'GREEN' : 'LOSS';
+
+  const upd = await pool.query(
+    `UPDATE football_sinais
+     SET estado=$2, resultado_final=$3, resolvido_em=NOW()
+     WHERE id=$1 AND estado='PENDENTE'
+     RETURNING id, direcao, martingale_nivel, stake_sugerida, confianca`,
+    [sig.id, novoEstado, resultado]
+  );
+  if (!upd.rowCount) return null;
+  const s = upd.rows[0];
+
+  let level = Number(s.martingale_nivel);
+  if (isGreen) level = 0;
+  else level = Math.min(CFG.martingaleMax + 1, level + 1);
+  await setMartingaleLevel(level);
+
+  await logEvent('signal_resolved', `Sinal ${novoEstado}`, {
+    id: s.id, direcao: s.direcao, resultado, martingale: level
+  });
+
+  const icon = isGreen ? '🟢 GREEN' : '🔴 LOSS';
+  const nextLevelMsg = isGreen
+    ? 'Martingale resetado para nível 0.'
+    : level > CFG.martingaleMax
+      ? `⚠️ Martingale atingiu nível máximo (${CFG.martingaleMax}). Parar e reavaliar.`
+      : `Próximo stake (nível ${level}): ${stakeForLevel(level)} un.`;
+
+  await telegramSend(
+    `${icon} — FOOTBALL STUDIO\n` +
+    `Sinal #${s.id} · ${s.direcao}\n` +
+    `Resultado da rodada: ${resultado}\n` +
+    `Confiança: ${s.confianca}%\n` +
+    `${nextLevelMsg}`
+  );
+
+  return { id: s.id, estado: novoEstado, resultado, level };
 }
-// Replays every available closed candle after signal creation, not just the
-// latest candle. This reduces missed TP/SL events after temporary downtime.
-// If TP and SL are both inside the same candle, conservatively count LOSS.
-const eligibleCandles = (candles5m || []).filter(c => {
-const candleCloseTime = c.time + 5 * 60000;
-return candleCloseTime > createdAt && c.time < expiresAt;
+
+async function generateSignal(history) {
+  if (history.length < CFG.minSamples) {
+    return { created: false, reason: 'insufficient_history', samples: history.length };
+  }
+  const analysis = combineSignals(history);
+  if (!analysis.direction) return { created: false, reason: 'no_pattern' };
+  if (analysis.confidence < CFG.minConfidence) {
+    return { created: false, reason: 'below_min_confidence', confidence: analysis.confidence };
+  }
+  if (analysis.direction === 'DRAW' && !CFG.allowDrawSignals) {
+    return { created: false, reason: 'draw_disabled' };
+  }
+
+  const { rows: recent } = await pool.query(
+    "SELECT criado_em FROM football_sinais ORDER BY id DESC LIMIT 1"
+  );
+  if (recent.rowCount && (Date.now() - new Date(recent.rows[0].criado_em).getTime()) < CFG.antiSpamSec * 1000) {
+    return { created: false, reason: 'anti_spam' };
+  }
+
+  const client = await pool.connect();
+  let newId;
+  try {
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('football_signal_engine'))");
+    const pending = await pendingSignal(client);
+    if (pending) { await client.query('COMMIT'); return { created: false, reason: 'pending_exists', id: pending.id }; }
+
+    const level = await getMartingaleLevel();
+    const stake = stakeForLevel(level);
+    const expira = new Date(Date.now() + CFG.signalExpirySec * 1000);
+
+    const ins = await client.query(
+      `INSERT INTO football_sinais
+       (direcao, confianca, estado, martingale_nivel, stake_sugerida, estrategias, expiracao_em, metadados)
+       VALUES($1,$2,'PENDENTE',$3,$4,$5,$6,$7::jsonb)
+       RETURNING id`,
+      [
+        analysis.direction,
+        analysis.confidence,
+        level,
+        stake,
+        analysis.strategies,
+        expira,
+        JSON.stringify({ reasons: analysis.reasons, history_size: history.length })
+      ]
+    );
+    newId = ins.rows[0].id;
+    await client.query('COMMIT');
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw e;
+  } finally { client.release(); }
+
+  await logEvent('signal_opened', 'Novo sinal', {
+    id: newId, direction: analysis.direction, confidence: analysis.confidence
+  });
+
+  const lvl = await getMartingaleLevel();
+  const stake = stakeForLevel(lvl);
+  const emoji = analysis.direction === 'HOME' ? '🔴' : analysis.direction === 'AWAY' ? '🔵' : '⚪';
+  await telegramSend(
+    `⚽ NOVO SINAL — FOOTBALL STUDIO\n\n` +
+    `${emoji} DIREÇÃO: ${analysis.direction}\n` +
+    `🎯 Confiança: ${analysis.confidence}%\n` +
+    `💰 Stake sugerida: ${stake} un. (nível ${lvl})\n` +
+    `🧠 Estratégias: ${analysis.strategies.join(', ')}\n` +
+    `📊 ${analysis.reasons.join(' | ')}\n` +
+    `⏱️ Expira em ${CFG.signalExpirySec}s\n` +
+    `🆔 Sinal #${newId}`
+  );
+
+  return { created: true, id: newId, direction: analysis.direction, confidence: analysis.confidence, stake, level: lvl };
+}
+
+/* ============================ RESULT PIPELINE ============================ */
+async function processNewResult(payload) {
+  const { roundId, homeCard, awayCard, resultado, hash, origem } = payload;
+
+  let result = resultado;
+  if (!result) {
+    const rank = c => {
+      const v = String(c).toUpperCase();
+      if (v === 'A' || v === 'ACE') return 1;
+      if (['J', 'JACK'].includes(v)) return 11;
+      if (['Q', 'QUEEN'].includes(v)) return 12;
+      if (['K', 'KING'].includes(v)) return 13;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const rH = rank(homeCard), rA = rank(awayCard);
+    if (rH !== null && rA !== null) {
+      result = rH > rA ? 'HOME' : rH < rA ? 'AWAY' : 'DRAW';
+    }
+  }
+  if (!['HOME', 'AWAY', 'DRAW'].includes(result)) {
+    throw new Error('resultado inválido (HOME|AWAY|DRAW)');
+  }
+  if (!homeCard || !awayCard) throw new Error('homeCard e awayCard são obrigatórios');
+
+  let inserted = null;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO football_resultados(round_id,home_card,away_card,resultado,hash,origem)
+       VALUES($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (round_id) WHERE round_id IS NOT NULL DO NOTHING
+       RETURNING *`,
+      [roundId || null, String(homeCard), String(awayCard), result, hash || null, origem || 'webhook']
+    );
+    inserted = rows[0] || null;
+  } catch (e) {
+    throw new Error('Falha ao gravar resultado: ' + errText(e));
+  }
+
+  if (!inserted) return { duplicate: true, roundId };
+
+  const resolution = await resolvePendingByResult(result);
+
+  const { rows: hist } = await pool.query(
+    `SELECT resultado FROM football_resultados ORDER BY id DESC LIMIT $1`,
+    [CFG.historyLimit]
+  );
+  const nextSignal = await generateSignal(hist);
+
+  await logEvent('result_processed', 'Novo resultado', {
+    roundId, resultado: result, resolution, nextSignal
+  });
+
+  return { inserted, resolution, nextSignal };
+}
+
+/* ============================================================
+   DATA SOURCE ADAPTERS — Football Studio
+   ============================================================ */
+const CARD_RANK = {
+  'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7,
+  '8': 8, '9': 9, '10': 10, 'J': 11, 'Q': 12, 'K': 13
+};
+function cardRank(c) { return CARD_RANK[String(c).toUpperCase().trim()] ?? null; }
+function computeResult(h, a) {
+  const rh = cardRank(h), ra = cardRank(a);
+  if (rh == null || ra == null) return null;
+  return rh > ra ? 'HOME' : rh < ra ? 'AWAY' : 'DRAW';
+}
+
+const BROWSER_HEADERS = {
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+};
+
+function normalizeRounds(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const r of list) {
+    if (!r || typeof r !== 'object') continue;
+    const homeCard = r.homeCard ?? r.home_card ?? r.home ?? r.homeValue ?? r.h ?? r.playerHome ?? r.home_rank;
+    const awayCard = r.awayCard ?? r.away_card ?? r.away ?? r.awayValue ?? r.a ?? r.playerAway ?? r.away_rank;
+    if (homeCard == null || awayCard == null) continue;
+    const resultado = r.resultado ?? computeResult(homeCard, awayCard);
+    if (!['HOME', 'AWAY', 'DRAW'].includes(resultado)) continue;
+    out.push({
+      roundId: String(r.roundId ?? r.round_id ?? r.id ?? r.roundHash ?? r.hash ?? '') || null,
+      homeCard: String(homeCard),
+      awayCard: String(awayCard),
+      resultado,
+      hash: r.hash ?? r.roundHash ?? r.serverSeedHash ?? null,
+      timestamp: r.timestamp ?? r.createdAt ?? r.time ?? r.startTime ?? null
+    });
+  }
+  return out;
+}
+
+async function fetchCasinoScores() {
+  const { data } = await axios.get(CFG.casinoscoresUrl, {
+    params: { tableId: CFG.casinoscoresTableId },
+    headers: {
+      ...BROWSER_HEADERS,
+      'Origin': 'https://www.casinoscores.com',
+      'Referer': 'https://www.casinoscores.com/'
+    },
+    timeout: 15000
+  });
+  const list = Array.isArray(data)
+    ? data
+    : data?.data ?? data?.results ?? data?.items ?? data?.history ?? data?.games ?? [];
+  const rounds = normalizeRounds(list);
+  if (!rounds.length) throw new Error('casinoscores: nenhum round válido no payload');
+  return rounds;
+}
+
+async function fetchTracksino() {
+  const headers = { ...BROWSER_HEADERS, 'Referer': 'https://www.tracksino.com/' };
+  if (CFG.tracksinoToken) headers['Authorization'] = `Bearer ${CFG.tracksinoToken}`;
+  const { data } = await axios.get(CFG.tracksinoUrl, { headers, timeout: 15000 });
+  const list = Array.isArray(data)
+    ? data
+    : data?.data ?? data?.results ?? data?.games ?? data?.latest ?? [];
+  const rounds = normalizeRounds(list);
+  if (!rounds.length) throw new Error('tracksino: nenhum round válido no payload');
+  return rounds;
+}
+
+async function fetchGeneric() {
+  if (!CFG.genericApiUrl) throw new Error('GENERIC_API_URL não configurada');
+  const headers = { ...BROWSER_HEADERS };
+  if (CFG.genericApiKey) headers['Authorization'] = `Bearer ${CFG.genericApiKey}`;
+  const { data } = await axios.get(CFG.genericApiUrl, { headers, timeout: 15000 });
+  const list = Array.isArray(data) ? data : data?.results ?? data?.data ?? [];
+  const rounds = normalizeRounds(list);
+  if (!rounds.length) throw new Error('generic: nenhum round válido');
+  return rounds;
+}
+
+async function fetchFromAdapter(name) {
+  switch (name) {
+    case 'casinoscores': return fetchCasinoScores();
+    case 'tracksino':    return fetchTracksino();
+    case 'generic':      return fetchGeneric();
+    default: throw new Error(`Adapter desconhecido: ${name}`);
+  }
+}
+
+async function pollSources() {
+  if (shuttingDown || polling) return { skipped: true };
+  polling = true;
+  let lastResult = { ok: false };
+
+  try {
+    for (const source of CFG.sourcePriority) {
+      try {
+        const rounds = await fetchFromAdapter(source);
+        rounds.sort((a, b) => {
+          const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+          const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+          return ta - tb;
+        });
+
+        let newCount = 0;
+        for (const r of rounds) {
+          try {
+            const out = await processNewResult({ ...r, origem: source });
+            if (out?.inserted) newCount++;
+          } catch (_) { /* duplicado ou inválido */ }
+        }
+
+        sourceHealth[source] = {
+          ok: true, lastOk: Date.now(), lastError: null,
+          lastCount: rounds.length, lastNew: newCount
+        };
+        if (newCount > 0) {
+          await logEvent('source_ok', `Fonte ${source}: +${newCount} rodadas`, {
+            total: rounds.length, new: newCount
+          });
+        }
+        lastResult = { ok: true, source, total: rounds.length, newRounds: newCount };
+        return lastResult;
+      } catch (e) {
+        sourceHealth[source] = {
+          ...(sourceHealth[source] || {}), ok: false, lastError: errText(e)
+        };
+        await logEvent('source_fail', `Fonte ${source} falhou`, { error: errText(e) });
+        console.error(`[poll:${source}]`, errText(e));
+      }
+    }
+    lastError = 'Todas as fontes falharam';
+    return { ok: false, error: lastError };
+  } finally {
+    polling = false;
+  }
+}
+
+async function startSourcePolling() {
+  if (sourceTimer) clearInterval(sourceTimer);
+  pollSources().catch(e => console.error('[poll initial]', errText(e)));
+  sourceTimer = setInterval(
+    () => pollSources().catch(e => console.error('[poll]', errText(e))),
+    CFG.sourcePollMs
+  );
+  console.log(`[SOURCES] Polling iniciado: ${CFG.sourcePriority.join(' → ')} a cada ${CFG.sourcePollMs}ms`);
+}
+
+/* ============================ MIDDLEWARES ============================ */
+function auth(req, res, next) {
+  if (!CFG.apiKey) return res.status(503).json({ ok: false, error: 'API_KEY não configurada' });
+  const key = req.get('x-api-key') || '';
+  if (key.length !== CFG.apiKey.length || key !== CFG.apiKey) {
+    return res.status(401).json({ ok: false, error: 'API key inválida' });
+  }
+  next();
+}
+function webhookAuth(req, res, next) {
+  if (!CFG.webhookSecret) return next();
+  const key = req.get('x-webhook-secret') || req.query.secret || req.body?.secret || '';
+  if (key !== CFG.webhookSecret) return res.status(401).json({ ok: false, error: 'Webhook secret inválido' });
+  next();
+}
+function asyncRoute(fn) { return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next); }
+
+/* ============================ ROUTES ============================ */
+app.get('/', (_req, res) => res.json({
+  name: 'Football Studio Signal Server',
+  version: '1.1.0',
+  market: 'Evolution Football Studio',
+  mode: 'api polling + webhook',
+  sources: CFG.sourcePriority,
+  strategies: Object.keys(CFG.strategies).filter(k => CFG.strategies[k])
+}));
+
+app.get('/health', asyncRoute(async (_req, res) => {
+  let db = 'up';
+  try { await pool.query('SELECT 1'); } catch { db = 'down'; }
+  const ok = db === 'up' && !shuttingDown;
+  res.status(ok ? 200 : 503).json({
+    ok, db, uptime: Math.floor(process.uptime()),
+    lastError, shuttingDown
+  });
+}));
+
+app.get('/status', auth, asyncRoute(async (_req, res) => {
+  const stats = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE estado='GREEN')::int AS green,
+      COUNT(*) FILTER (WHERE estado='LOSS')::int AS loss,
+      COUNT(*) FILTER (WHERE estado='PENDENTE')::int AS pending,
+      COUNT(*)::int AS total
+    FROM football_sinais
+  `);
+  const totalResults = await pool.query('SELECT COUNT(*)::int AS n FROM football_resultados');
+  const martingale = await getMartingaleLevel();
+  const lastSig = await pool.query('SELECT * FROM football_sinais ORDER BY id DESC LIMIT 1');
+  const lastRes = await pool.query('SELECT * FROM football_resultados ORDER BY id DESC LIMIT 10');
+
+  const s = stats.rows[0];
+  const settled = s.green + s.loss;
+  res.json({
+    ok: true,
+    config: {
+      minConfidence: CFG.minConfidence,
+      minSamples: CFG.minSamples,
+      signalExpirySec: CFG.signalExpirySec,
+      martingaleMax: CFG.martingaleMax,
+      baseUnit: CFG.baseUnit,
+      strategies: CFG.strategies,
+      sourcePriority: CFG.sourcePriority,
+      sourcePollMs: CFG.sourcePollMs
+    },
+    stats: { ...s, settled, winrate: settled ? round(s.green / settled * 100, 2) : null },
+    martingale_level: martingale,
+    next_stake: stakeForLevel(martingale),
+    total_results: totalResults.rows[0].n,
+    last_signal: lastSig.rows[0] || null,
+    last_results: lastRes.rows,
+    sources: Object.fromEntries(
+      Object.entries(sourceHealth).map(([k, v]) => [k, {
+        ok: v.ok,
+        lastOk: v.lastOk ? new Date(v.lastOk).toISOString() : null,
+        lastError: v.lastError || null
+      }])
+    )
+  });
+}));
+
+app.get('/resultados', asyncRoute(async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const { rows } = await pool.query(
+    'SELECT * FROM football_resultados ORDER BY id DESC LIMIT $1', [limit]
+  );
+  res.json({ ok: true, count: rows.length, items: rows });
+}));
+
+app.get('/sinais', asyncRoute(async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 30));
+  const { rows } = await pool.query(
+    'SELECT * FROM football_sinais ORDER BY id DESC LIMIT $1', [limit]
+  );
+  res.json({ ok: true, count: rows.length, items: rows });
+}));
+
+app.get('/placar', asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE estado='GREEN')::int AS green,
+      COUNT(*) FILTER (WHERE estado='LOSS')::int AS loss,
+      COUNT(*) FILTER (WHERE estado='PENDENTE')::int AS pending,
+      COUNT(*) FILTER (WHERE estado='EXPIRADO')::int AS expirado
+    FROM football_sinais
+    WHERE criado_em::date = CURRENT_DATE
+  `);
+  const s = rows[0];
+  const settled = s.green + s.loss;
+  res.json({
+    ok: true,
+    date: new Date().toISOString().slice(0, 10),
+    ...s,
+    settled,
+    winrate: settled ? round(s.green / settled * 100, 2) : null
+  });
+}));
+
+app.get('/eventos', auth, asyncRoute(async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const { rows } = await pool.query(
+    'SELECT * FROM football_eventos ORDER BY id DESC LIMIT $1', [limit]
+  );
+  res.json({ ok: true, count: rows.length, items: rows });
+}));
+
+app.get('/sources', asyncRoute(async (_req, res) => {
+  const out = {};
+  for (const s of CFG.sourcePriority) {
+    const h = sourceHealth[s] || {};
+    out[s] = {
+      ok: h.ok ?? null,
+      lastOk: h.lastOk ? new Date(h.lastOk).toISOString() : null,
+      lastError: h.lastError || null,
+      lastCount: h.lastCount ?? null,
+      lastNew: h.lastNew ?? null
+    };
+  }
+  res.json({ ok: true, priority: CFG.sourcePriority, pollMs: CFG.sourcePollMs, sources: out });
+}));
+
+/* ============ RECEPÇÃO DE RESULTADOS ============ */
+app.post('/webhook/resultado', webhookAuth, asyncRoute(async (req, res) => {
+  const b = req.body || {};
+  if (!b.homeCard || !b.awayCard) {
+    return res.status(400).json({ ok: false, error: 'homeCard e awayCard são obrigatórios' });
+  }
+  const out = await processNewResult({
+    roundId: b.roundId || b.round_id || null,
+    homeCard: b.homeCard,
+    awayCard: b.awayCard,
+    resultado: b.resultado || null,
+    hash: b.hash || null,
+    origem: b.origem || 'webhook'
+  });
+  res.json({ ok: true, ...out });
+}));
+
+app.post('/poll', auth, asyncRoute(async (_req, res) => {
+  const r = await pollSources();
+  res.json({ ok: true, ...r });
+}));
+
+app.get('/test-source', auth, asyncRoute(async (req, res) => {
+  const name = String(req.query.name || '');
+  const names = name ? [name] : CFG.sourcePriority;
+  const results = {};
+  for (const n of names) {
+    try {
+      const rounds = await fetchFromAdapter(n);
+      results[n] = { ok: true, count: rounds.length, sample: rounds.slice(0, 5) };
+    } catch (e) {
+      results[n] = { ok: false, error: errText(e) };
+    }
+  }
+  res.json({ ok: true, sources: results });
+}));
+
+app.post('/scan', auth, asyncRoute(async (_req, res) => {
+  if (scanning) return res.json({ ok: false, reason: 'scan_in_progress' });
+  scanning = true;
+  try {
+    const { rows: hist } = await pool.query(
+      `SELECT resultado FROM football_resultados ORDER BY id DESC LIMIT $1`,
+      [CFG.historyLimit]
+    );
+    const sig = await generateSignal(hist);
+    res.json({ ok: true, result: sig });
+  } finally { scanning = false; }
+}));
+
+app.post('/sinais/:id/resolver', auth, asyncRoute(async (req, res) => {
+  const id = Number(req.params.id);
+  const { resultado } = req.body || {};
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ ok: false, error: 'id inválido' });
+  if (!['HOME', 'AWAY', 'DRAW'].includes(resultado)) return res.status(400).json({ ok: false, error: 'resultado inválido' });
+  const r = await resolvePendingByResult(resultado);
+  res.json({ ok: true, resolution: r });
+}));
+
+app.post('/martingale/reset', auth, asyncRoute(async (_req, res) => {
+  await setMartingaleLevel(0);
+  res.json({ ok: true, level: 0 });
+}));
+
+/* ============ ERRO GLOBAL ============ */
+app.use((err, _req, res, _next) => {
+  lastError = errText(err);
+  console.error('[HTTP]', lastError);
+  res.status(500).json({ ok: false, error: lastError });
 });
-for (const candle of eligibleCandles) {
-let state = null;
-let exit = null;
-if (candle.low <= sl) {
-state = 'LOSS';
-exit = sl;
-} else if (candle.high >= tp) {
-state = 'GREEN';
-exit = tp;
-}
-if (!state) continue;
-const pnl = (exit - entry) / entry * 100;
-const result = await pool.query(
-`UPDATE trade_sinais
-SET estado=$2, preco_saida=$3, pnl_pct=$4, resolvido_em=NOW()
-WHERE id=$1 AND estado='PENDENTE' RETURNING id`,
-[signal.id, state, exit, round(pnl, 5)]
-);
-if (!result.rowCount) return;
-await logEvent('signal_resolved', `Sinal ${state}`, {
-id: signal.id, exit, pnlPct: round(pnl, 5), candleTime: candle.time
-});
-await telegramSend(
-`${state === 'GREEN' ? '■ GREEN' : '■ LOSS'} — CAPUNGA TRADE\n` +
-`Sinal #${signal.id} · BTC/USDT Spot\n` +
-`Entrada de referência: ${round(entry, 2)}\n` +
-`Saída simulada: ${round(exit, 2)}\n` +
-`Variação bruta: ${round(pnl, 3)}%\n` +
-`Resultado apurado por vela fechada; taxas e slippage excluídos.`
-);
-return;
-}
-if (Date.now() >= expiresAt) {
-const result = await pool.query(
-`UPDATE trade_sinais SET estado='EXPIRADO', preco_saida=$2, resolvido_em=NOW()
-WHERE id=$1 AND estado='PENDENTE' RETURNING id`,
-[signal.id, price]
-);
-if (result.rowCount) {
-await logEvent('signal_expired', 'Sinal expirado', { id: signal.id, price });
-await telegramSend(
-`■ CAPUNGA TRADE — SINAL EXPIRADO\n#${signal.id} · BTC/USDT Spot\n` +
-`Preço de referência: ${round(price, 2)}\n` +
-`Expirado sem TP/SL confirmado nas velas disponíveis.`
-);
-}
-}
-}
-async function createSignal(a, source) {
-const client=await pool.connect(); let signal;
-try {
-await client.query('BEGIN');
-await client.query("SELECT pg_advisory_xact_lock(hashtext('capunga_trade_signal_engine'))");
-const pending=await pendingSignal(client);
-if(pending) { await client.query('COMMIT'); return { opened:false, reason:'pending_exists', id:pending.id }; }
-const recent=await client.query("SELECT criado_em FROM trade_sinais ORDER BY id DESC LIMIT 1");
-if(recent.rowCount && Date.now()-new Date(recent.rows[0].criado_em).getTime()<CFG.antiSpamMs) { await client.query('COMMIT'); return
-const expires=new Date(Date.now()+CFG.expiryMs);
-const result=await client.query(`INSERT INTO trade_sinais(symbol,direcao,preco_entrada,preco_tp,preco_sl,score,estado,tp_pct,sl_pct,e
-VALUES($1,'BUY',$2,$3,$4,$5,'PENDENTE',$6,$7,$8,$9::jsonb) RETURNING id,criado_em`,[
-CFG.symbol,a.entry,a.tp,a.sl,a.score,round(a.tpPct,5),round(a.slPct,5),expires,JSON.stringify({reasons:a.reasons,rr:a.rr,features:a
-]);
-signal=result.rows[0]; await client.query('COMMIT'); lastSignalAt=Date.now();
-} catch(e) { try{await client.query('ROLLBACK');}catch(_){} throw e; } finally { client.release(); }
-await logEvent('signal_opened','Novo sinal BUY',{id:signal.id,entry:a.entry,tp:a.tp,sl:a.sl,score:a.score,source});
-const msg=`■ CAPUNGA TRADE — NOVO SINAL\n\n■ ATIVO: ${CFG.symbol.replace('USDT','/USDT')} Spot\n■ DIREÇÃO: BUY / COMPRA\n■ SINAL: #${s
-await telegramSend(msg);
-return {opened:true,id:signal.id};
-}
-async function scanOnce() {
-if(scanning) return {skipped:true,reason:'scan_in_progress'};
-scanning=true;
-try {
-const bundle=await fetchMarketBundle();
-const price=await fetchPrice(bundle.source);
-await resolvePending(price,bundle.m5);
-const a=analyze(bundle.m1,bundle.m5,bundle.m15);
-lastAnalysis={at:new Date().toISOString(),symbol:CFG.symbol,market:'Spot',price,source:bundle.source,score:a.score,eligible:a.ok,sign
-lastError=null; consecutiveErrors=0;
-if (a.ok) {
-const deviation = Math.abs(price - a.entry) / a.entry;
-if (deviation > CFG.maxDeviationPct) {
-lastAnalysis.eligible = false;
-lastAnalysis.signal = null;
-lastAnalysis.signalResult = { opened: false, reason: 'entry_price_moved', deviationPct: round(deviation * 100, 4), maxDeviationPc
-} else {
-lastAnalysis.signalResult = await createSignal(a, bundle.source);
-}
-}
-await logEvent('analysis','Análise de mercado concluída',{price,score:a.score,eligible:a.ok,source:bundle.source});
-return lastAnalysis;
-} catch(e) {
-lastError=errText(e); consecutiveErrors++;
-await logEvent('scan_error',lastError,{consecutiveErrors});
-console.error('[SCAN]',lastError);
-throw e;
-} finally { scanning=false; }
-}
-function auth(req,res,next) {
-if(!CFG.apiKey) return res.status(503).json({ok:false,error:'API_KEY não configurada; endpoints de controlo bloqueados.'});
-const key=req.get('x-api-key')||'';
-if(key.length!==CFG.apiKey.length || key!==CFG.apiKey) return res.status(401).json({ok:false,error:'API key inválida.'});
-next();
-}
-function asyncRoute(fn) { return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next); }
-app.get('/',(_req,res)=>res.json({name:'CAPUNGA TRADE Signal Server Pro',version:'5.1.0',market:'BTC/USDT Spot',mode:'continuous manual s
-app.get('/health',asyncRoute(async(_req,res)=>{
-let db='up'; try { await pool.query('SELECT 1'); } catch(e) { db='down'; }
-const ok=db==='up'&&!shuttingDown;
-res.status(ok?200:503).json({ok,db,uptimeSeconds:Math.floor(process.uptime()),symbol:CFG.symbol,market:'Spot',source:lastSource,lastAna
-}));
-app.get('/status',asyncRoute(async(_req,res)=>{
-const {rows}=await pool.query(`SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,C
-const s=rows[0]; const settled=s.green+s.loss;
-const pnl=await pool.query("SELECT COALESCE(SUM(pnl_pct),0)::float AS total_pnl_pct FROM trade_sinais WHERE estado IN ('GREEN','LOSS')"
-res.json({ok:true,symbol:CFG.symbol,market:'Spot',ordersExecuted:false,source:lastSource,config:{loopMs:CFG.loopMs,minScore:CFG.minScor
-}));
-app.get('/sinais',asyncRoute(async(req,res)=>{
-const limit=Math.min(100,Math.max(1,Number(req.query.limit)||20));
-const {rows}=await pool.query('SELECT id,symbol,direcao,preco_entrada,preco_tp,preco_sl,score,estado,tp_pct,sl_pct,preco_saida,pnl_pct,
-res.json({ok:true,count:rows.length,items:rows});
-}));
-app.get('/eventos',auth,asyncRoute(async(req,res)=>{
-const limit=Math.min(100,Math.max(1,Number(req.query.limit)||30));
-const {rows}=await pool.query('SELECT id,tipo,mensagem,dados,criado_em FROM trade_eventos ORDER BY id DESC LIMIT $1',[limit]); res.json
-}));
-app.get('/placar',asyncRoute(async(_req,res)=>{
-const {rows}=await pool.query(`SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,C
-const s=rows[0], n=s.green+s.loss;
-res.json({ok:true,date:new Date().toISOString().slice(0,10),...s,settled:n,winrate:n?round(s.green/n*100,2):null});
-}));
-app.post('/scan',auth,asyncRoute(async(_req,res)=>res.json({ok:true,result:await scanOnce()})));
-app.post('/validar-entrada',auth,asyncRoute(async(req,res)=>{
-const id=Number(req.body?.signalId), capital=Number(req.body?.capital);
-if(!Number.isSafeInteger(id)||id<1) return res.status(400).json({ok:false,valid:false,error:'signalId inválido.'});
-if(!Number.isFinite(capital)||capital<=0) return res.status(400).json({ok:false,valid:false,error:'capital deve ser positivo e expresso
-const {rows}=await pool.query('SELECT * FROM trade_sinais WHERE id=$1',[id]); const s=rows[0];
-if(!s) return res.status(404).json({ok:false,valid:false,error:'Sinal não encontrado.'});
-if(s.estado!=='PENDENTE'||Date.now()>=new Date(s.expiracao_em).getTime()) return res.status(409).json({ok:true,valid:false,reason:'Sina
-const entry=Number(s.preco_entrada),tp=Number(s.preco_tp),sl=Number(s.preco_sl),price=await fetchPrice(lastSource);
-const deviation=Math.abs(price-entry)/entry;
-if(!(sl<price&&price<tp)||deviation>CFG.maxDeviationPct) return res.status(409).json({ok:true,valid:false,reason:'Preço atual fora dos
-const riskBudget=capital*CFG.riskPct, qtyRisk=riskBudget/(price-sl), qtyCapital=capital/price;
-const qty=Math.floor(Math.min(qtyRisk,qtyCapital)*1e6)/1e6, exposure=qty*price;
-if(qty<=0||exposure<5) return res.status(422).json({ok:true,valid:false,reason:'Capital insuficiente para o mínimo indicativo de 5 USDT
-res.json({ok:true,valid:true,mode:'manual',ordersSent:false,signalId:id,symbol:s.symbol,signalEntryReference:entry,assumedManualEntry:p
-}));
-app.use((err,_req,res,_next)=>{ console.error('[HTTP]',errText(err)); res.status(500).json({ok:false,error:errText(err)}); });
+
+/* ============================ TELEGRAM ============================ */
 async function telegramCommand(text, chatId) {
-if (!CFG.botToken || !CFG.allowTelegramCommands) return;
-// Restrict command replies to configured chat ID.
-if (String(chatId) !== String(CFG.chatId)) return;
-const command=String(text||'').trim().split(/\s+/)[0].split('@')[0].toLowerCase();
-const send=async msg=>axios.post(`https://api.telegram.org/bot${CFG.botToken}/sendMessage`,{chat_id:chatId,text:msg,disable_web_page_pr
-if(command==='/start'||command==='/ajuda'||command==='/help') return send('■ CAPUNGA TRADE Signal Server Pro\n/status — estado do motor
-if(command==='/status') {
-const r=await pool.query("SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,COUN
-return send(`■ CAPUNGA TRADE\nMotor: ${scanning?'a analisar':'ativo'}\nMercado: ${CFG.symbol} Spot\nFonte: ${lastSource}\nGREEN: ${r.
+  if (!CFG.botToken || !CFG.allowTelegramCommands) return;
+  if (String(chatId) !== String(CFG.chatId)) return;
+  const cmd = String(text || '').trim().split(/\s+/)[0].split('@')[0].toLowerCase();
+  const send = msg => axios.post(
+    `https://api.telegram.org/bot${CFG.botToken}/sendMessage`,
+    { chat_id: chatId, text: msg, disable_web_page_preview: true }, { timeout: 10000 }
+  );
+
+  if (['/start', '/ajuda', '/help'].includes(cmd)) {
+    return send(
+      '⚽ Football Studio Signal Server\n\n' +
+      '/status — estado + Martingale\n' +
+      '/placar — placar do dia\n' +
+      '/historico — últimos 10 sinais\n' +
+      '/ultimos — últimos 10 resultados\n' +
+      '/sources — status das fontes de dados\n' +
+      '/scan — gerar sinal agora\n' +
+      '/reset — resetar Martingale'
+    );
+  }
+
+  if (cmd === '/status') {
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE estado='GREEN')::int g,
+        COUNT(*) FILTER (WHERE estado='LOSS')::int l,
+        COUNT(*) FILTER (WHERE estado='PENDENTE')::int p
+      FROM football_sinais`);
+    const s = rows[0]; const settled = s.g + s.l;
+    const lvl = await getMartingaleLevel();
+    return send(
+      `⚽ STATUS\nMotor: ${scanning ? 'analisando' : 'ativo'}\n` +
+      `🟢 ${s.g} · 🔴 ${s.l} · ⏳ ${s.p}\n` +
+      `Winrate: ${settled ? round(s.g / settled * 100, 1) : '—'}%\n` +
+      `Martingale: nível ${lvl} · próximo stake: ${stakeForLevel(lvl)} un.`
+    );
+  }
+
+  if (cmd === '/placar') {
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE estado='GREEN')::int g,
+        COUNT(*) FILTER (WHERE estado='LOSS')::int l
+      FROM football_sinais WHERE criado_em::date = CURRENT_DATE`);
+    const s = rows[0]; const n = s.g + s.l;
+    return send(`⚽ PLACAR DO DIA\n🟢 GREEN: ${s.g}\n🔴 LOSS: ${s.l}\nPrecisão: ${n ? round(s.g / n * 100, 1) : '—'}%`);
+  }
+
+  if (cmd === '/historico') {
+    const { rows } = await pool.query(
+      'SELECT id,direcao,confianca,estado,resultado_final FROM football_sinais ORDER BY id DESC LIMIT 10'
+    );
+    if (!rows.length) return send('Sem sinais ainda.');
+    const lines = rows.map(s =>
+      `#${s.id} ${s.direcao} (${s.confianca}%) → ${s.estado}${s.resultado_final ? ' [' + s.resultado_final + ']' : ''}`
+    );
+    return send('⚽ ÚLTIMOS SINAIS\n' + lines.join('\n'));
+  }
+
+  if (cmd === '/ultimos') {
+    const { rows } = await pool.query(
+      'SELECT home_card,away_card,resultado FROM football_resultados ORDER BY id DESC LIMIT 10'
+    );
+    if (!rows.length) return send('Sem resultados ainda.');
+    const lines = rows.map(r => `${r.home_card}×${r.away_card} → ${r.resultado}`);
+    return send('⚽ ÚLTIMOS RESULTADOS\n' + lines.join('\n'));
+  }
+
+  if (cmd === '/sources') {
+    const lines = CFG.sourcePriority.map(s => {
+      const h = sourceHealth[s] || {};
+      return `${h.ok ? '🟢' : '🔴'} ${s}${h.lastCount ? ` (${h.lastCount} rodadas)` : ''}${h.lastError ? ` — ${h.lastError.slice(0, 60)}` : ''}`;
+    });
+    return send('🔌 FONTES DE DADOS\n' + lines.join('\n'));
+  }
+
+  if (cmd === '/scan') {
+    await send('🔍 Analisando…');
+    const { rows: hist } = await pool.query(
+      'SELECT resultado FROM football_resultados ORDER BY id DESC LIMIT $1', [CFG.historyLimit]
+    );
+    const sig = await generateSignal(hist);
+    return send(sig.created
+      ? `⚽ Sinal #${sig.id} → ${sig.direction} (${sig.confidence}%) · stake ${sig.stake} un.`
+      : `Sem sinal: ${sig.reason || 'sem padrão'}`);
+  }
+
+  if (cmd === '/reset') {
+    await setMartingaleLevel(0);
+    return send('🔄 Martingale resetado para nível 0.');
+  }
 }
-if(command==='/placar') {
-const r=await pool.query("SELECT COUNT(*) FILTER(WHERE estado='GREEN')::int green,COUNT(*) FILTER(WHERE estado='LOSS')::int loss,COUN
-const s=r.rows[0], settled=s.green+s.loss;
-return send(`■ PLACAR DO DIA\n■ GREEN: ${s.green}\n■ LOSS: ${s.loss}\n■ PENDENTES: ${s.pending}\nPrecisão histórica apurada: ${settl
-}
-if(command==='/historico') {
-const r=await pool.query('SELECT id,estado,preco_entrada,preco_saida,criado_em FROM trade_sinais ORDER BY id DESC LIMIT 10');
-const lines=r.rows.map(s=>`#${s.id} ${s.estado} | entrada ${round(Number(s.preco_entrada),2)} | saída ${s.preco_saida?round(Number(s.
-return send(`■ ÚLTIMOS SINAIS\n${lines||'Ainda não existem sinais.'}`);
-}
-if(command==='/scan') { await send('■ A analisar o mercado.'); try { const result=await scanOnce(); await send(`■ RESULTADO DA ANÁLISE\
-}
+
 async function pollTelegram() {
-if(!CFG.botToken||!CFG.allowTelegramCommands||shuttingDown) return;
-try {
-const {data}=await axios.get(`https://api.telegram.org/bot${CFG.botToken}/getUpdates`,{params:{offset:telegramOffset,timeout:0,allowe
-if(!data?.ok||!Array.isArray(data.result)) return;
-for(const update of data.result) {
-telegramOffset=Math.max(telegramOffset,Number(update.update_id)+1);
-const msg=update.message;
-if(msg?.text) await telegramCommand(msg.text,msg.chat?.id);
+  if (!CFG.botToken || !CFG.allowTelegramCommands || shuttingDown) return;
+  try {
+    const { data } = await axios.get(
+      `https://api.telegram.org/bot${CFG.botToken}/getUpdates`,
+      { params: { offset: telegramOffset, timeout: 0, allowed_updates: ['message'] }, timeout: 15000 }
+    );
+    if (!data?.ok || !Array.isArray(data.result)) return;
+    for (const u of data.result) {
+      telegramOffset = Math.max(telegramOffset, Number(u.update_id) + 1);
+      const msg = u.message;
+      if (msg?.text) await telegramCommand(msg.text, msg.chat?.id);
+    }
+  } catch (e) { console.error('[TG poll]', errText(e)); }
 }
-} catch(e) { console.error('[Telegram poll]',errText(e)); }
-}
+
+/* ============================ SHUTDOWN ============================ */
 async function shutdown() {
-if(shuttingDown) return; shuttingDown=true;
-if(scanTimer) clearInterval(scanTimer); if(keepaliveTimer) clearInterval(keepaliveTimer); if(telegramTimer) clearInterval(telegramTimer
-if(server) await new Promise(resolve=>server.close(resolve));
-if(pool) await pool.end();
-process.exit(0);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const t of [keepaliveTimer, telegramTimer, sourceTimer]) {
+    try { clearInterval(t); } catch (_) {}
+  }
+  if (server) await new Promise(r => server.close(r));
+  if (pool) await pool.end();
+  process.exit(0);
 }
+
+/* ============================ MAIN ============================ */
 async function main() {
-await initDB();
-server=app.listen(CFG.port,'0.0.0.0',()=>console.log(`[HTTP] CAPUNGA TRADE Signal Server Pro v5.1 · BTC/USDT Spot · :${CFG.port}`));
-try { await scanOnce(); } catch(e) { console.error('[initial scan]',errText(e)); }
-scanTimer=setInterval(()=>scanOnce().catch(()=>{}),CFG.loopMs);
-if(CFG.keepaliveUrl) keepaliveTimer=setInterval(()=>axios.get(CFG.keepaliveUrl.replace(/\/$/,'')+'/health',{timeout:10000}).catch(()=>{
-if(CFG.botToken&&CFG.allowTelegramCommands) { telegramTimer=setInterval(()=>pollTelegram().catch(()=>{}),CFG.telegramPollMs); pollTeleg
-process.on('SIGTERM',shutdown); process.on('SIGINT',shutdown);
+  await initDB();
+  server = app.listen(CFG.port, '0.0.0.0', () => {
+    console.log(`[HTTP] Football Studio Signal Server v1.1 · :${CFG.port}`);
+  });
+
+  if (CFG.keepaliveUrl) {
+    keepaliveTimer = setInterval(() =>
+      axios.get(CFG.keepaliveUrl.replace(/\/$/, '') + '/health', { timeout: 10000 }).catch(() => {}),
+      4 * 60000
+    );
+  }
+  if (CFG.botToken && CFG.allowTelegramCommands) {
+    telegramTimer = setInterval(() => pollTelegram().catch(() => {}), CFG.telegramPollMs);
+    pollTelegram().catch(() => {});
+  }
+
+  await startSourcePolling();
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
-main().catch(e=>{console.error('[FATAL]',errText(e));process.exit(1);});
+main().catch(e => { console.error('[FATAL]', errText(e)); process.exit(1); });
