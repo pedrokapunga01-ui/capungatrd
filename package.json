@@ -1,19 +1,20 @@
 {
-  "name": "capunga-bacbo-gale2",
-  "version": "9.0.0",
-  "description": "Capunga Dados - Bac Bo, sinais ate Gale 2 a cada 5 minutos",
-  "main": "server.js",
+  "name": "capunga-bacbo",
+  "version": "10.0.0",
+  "description": "Bot de sinais Bac Bo — Gale 1 · multi-fator · 24/7",
+  "main": "index.js",
   "private": true,
-  "scripts": {
-    "start": "node server.js"
-  },
+  "license": "MIT",
   "engines": {
-    "node": "22.x"
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.7.9",
+    "axios": "^1.7.7",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
+    "express": "^4.21.1",
     "pg": "^8.13.1"
   }
 }
