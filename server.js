@@ -1,21 +1,26 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v11
+ * CAPUNGA DADOS — BAC BO · v12
  *
- *  ✅ Gale 1 (máximo)
- *  ✅ Sem "sinal expirado" — o sinal fica aberto até a mesa resolver
- *  ✅ Confiança multi-fator (>88% = dispara · configurável)
- *  ✅ Estilo de mensagem reformulado
- *  ✅ Keep-alive robusto (não dorme)
- *  ✅ Filtro estrito — só entra quando as probabilidades alinham
+ *  ✅ Gale 1 (máximo) — 2 tentativas por sinal (entrada + 1 gale)
+ *  ✅ Sem expiração — sinal fica aberto até a mesa resolver
+ *  ✅ Confiança 80–100 = probabilidade conservadora (Wilson 99.5%)
+ *  ✅ Filtro duro: só dispara ≥ MIN_CONFIANCA (default 88)
+ *  ✅ Threshold sobe em série vermelha (88 → 90 → 92)
+ *  ✅ Mensagens reformuladas (compactas, certeiras)
+ *  ✅ Keep-alive robusto (self-ping + healthchecks externo)
+ *  ✅ Backoff automático se API falhar
+ *  ✅ Limpeza de pendentes órfãos no arranque (não é expiração)
  *
- * Variáveis:
- *   BOT_TOKEN · CHAT_ID · WEBHOOK_SECRET · DATABASE_URL · ADMIN_TOKEN
- *   API_BACBO · MIN_AMOSTRA (80) · MIN_CONFIANCA (88)
- *   SYNC_MS (3000) · SINAL_INICIAL (1)
- *   EMPATE_VALE_GREEN (true) · STREAK_ADJUST (true)
- *   SELF_URL / RENDER_EXTERNAL_URL · KEEPALIVE_MS (240000)
+ * Variáveis de ambiente:
+ *   Obrigatórias:  BOT_TOKEN · CHAT_ID
+ *   Recomendadas:  ADMIN_TOKEN · WEBHOOK_SECRET · DATABASE_URL · SELF_URL
+ *   Opcionais:     HEALTHCHECK_URL · API_BACBO · MIN_AMOSTRA (200)
+ *                  MIN_CONFIANCA (88) · CONFIANCA_MAX (98) · SYNC_MS (3000)
+ *                  SINAL_INICIAL (1) · EMPATE_VALE_GREEN (true)
+ *                  STREAK_ADJUST (true) · SINAIS_ATIVOS (true)
+ *                  KEEPALIVE_MS (240000) · HEALTHCHECK_MS (300000)
  */
 
 const express = require('express');
@@ -47,9 +52,10 @@ const SLOT_MS = 5 * 60 * 1000;
 const CFG = {
   ativos: bool(process.env.SINAIS_ATIVOS, true),
   empateGreen: bool(process.env.EMPATE_VALE_GREEN, true),
-  minAmostra: num('MIN_AMOSTRA', 80, 20, 5000),
-  minConfianca: num('MIN_CONFIANCA', 88, 60, 99),
   streakAdjust: bool(process.env.STREAK_ADJUST, true),
+  minAmostra: num('MIN_AMOSTRA', 200, 100, 5000),
+  minConfianca: num('MIN_CONFIANCA', 88, 80, 98),
+  confiancaMax: num('CONFIANCA_MAX', 98, 90, 100),
   syncMs: num('SYNC_MS', 3000, 2000, 30000),
   sinalInicial: num('SINAL_INICIAL', 1, 1, 100000000),
   maxHist: 5000,
@@ -91,13 +97,18 @@ const R = {
   ultimoSinal: null,
   ultimaConfiancaBloqueada: null,
   telegramPendentes: 0,
-  ultimoKeepAlive: null
+  ultimoKeepAlive: null,
+  keepAliveFails: 0,
+  keepAliveOk: null,
+  hcOk: null
 };
 
 let pool = null;
 let server = null;
 let syncTimer = null;
 let slotTimer = null;
+let keepTimer = null;
+let hcTimer = null;
 let busy = false;
 let stopping = false;
 
@@ -128,7 +139,7 @@ const corCurta = (c) => (c === B ? '🔴 Banca' : c === J ? '🔵 Jogador' : '�
 function normalizeOutcome(v) {
   if (v && typeof v === 'object') v = v.outcome ?? v.resultado ?? v.winner ?? v.name;
   const s = String(v ?? '')
-    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .trim().toLowerCase().replace(/[\s_-]+/g, '');
   if (['player', 'jogador', 'playerwin', 'playerwins', 'playerwon', 'playerwinner', 'blue', 'azul'].includes(s)) return J;
   if (['banker', 'banca', 'bankerwin', 'bankerwins', 'bankerwon', 'bankerwinner', 'red', 'vermelho'].includes(s)) return B;
@@ -230,7 +241,7 @@ async function fetchRoundsFromAPI() {
     try {
       const resp = await axios.get(API_BACBO, {
         timeout: 15000,
-        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDadosBot/11.0' }
+        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDadosBot/12.0' }
       });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
@@ -267,6 +278,17 @@ async function syncFromAPI() {
   }
 }
 
+function scheduleSync() {
+  const wait = (R.ciclosSemNovos >= 20 && R.erroAPI)
+    ? Math.min(30000, CFG.syncMs * 4)
+    : CFG.syncMs;
+  syncTimer = setTimeout(async () => {
+    await syncFromAPI().catch(() => {});
+    if (!stopping) scheduleSync();
+  }, wait);
+  if (typeof syncTimer.unref === 'function') syncTimer.unref();
+}
+
 /* ============================ ESTRATÉGIAS ============================ */
 
 function windowAt(H, i) {
@@ -296,25 +318,25 @@ const STRATS = [
   function quebra({ seq }) {
     const n = streak(seq);
     if (n < 3 || n > 9) return null;
-    return { cor: opp(seq[0].resultado), key: `QUEBRA_${Math.min(n, 7)}`, nome: `Quebra de sequência x${n}`, emoji: '💥' };
+    return { cor: opp(seq[0].resultado), key: `QUEBRA_${Math.min(n, 7)}`, nome: `Quebra x${n}`, emoji: '💥' };
   },
   function surf({ seq }) {
     if (seq.length < 4) return null;
     let L = 1;
     while (L < seq.length && seq[L].resultado !== seq[L - 1].resultado) L++;
     if (L < 3) return null;
-    return { cor: opp(seq[0].resultado), key: `SURF_${Math.min(L, 6)}`, nome: `Surf (alternância ${L})`, emoji: '🌊' };
+    return { cor: opp(seq[0].resultado), key: `SURF_${Math.min(L, 6)}`, nome: `Surf x${L}`, emoji: '🌊' };
   },
   function doisDois({ seq }) {
     if (seq.length < 4) return null;
     const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a === b && c === d && a !== c) return { cor: c, key: 'DOIS_DOIS', nome: '2+2 (blocos de dois)', emoji: '♟️' };
+    if (a === b && c === d && a !== c) return { cor: c, key: 'DOIS_DOIS', nome: '2+2', emoji: '♟️' };
     return null;
   },
   function tresUm({ seq }) {
     if (seq.length < 4) return null;
     const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a !== b && b === c && c === d) return { cor: a, key: 'TRES_UM', nome: 'Quebra confirmada (3→1)', emoji: '🧩' };
+    if (a !== b && b === c && c === d) return { cor: a, key: 'TRES_UM', nome: '3→1', emoji: '🧩' };
     return null;
   },
   function forca({ seq }) {
@@ -325,7 +347,7 @@ const STRATS = [
     const pct = Math.max(pj, 1 - pj);
     if (pct < 0.67) return null;
     const bucket = pct >= 0.75 ? 75 : pct >= 0.7 ? 70 : 67;
-    return { cor: dom, key: `FORCA_${bucket}`, nome: `Força da mesa ${Math.round(pct * 100)}%`, emoji: '💪' };
+    return { cor: dom, key: `FORCA_${bucket}`, nome: `Força ${Math.round(pct * 100)}%`, emoji: '💪' };
   },
   function reversao({ seq }) {
     const s = seq.slice(0, 20);
@@ -333,12 +355,12 @@ const STRATS = [
     const pj = s.filter((x) => x.resultado === J).length / s.length;
     const pct = Math.max(pj, 1 - pj);
     if (pct < 0.65) return null;
-    return { cor: opp(pj >= 0.5 ? J : B), key: 'REVERSAO_20', nome: `Retorno à média (${Math.round(pct * 100)}%)`, emoji: '⚖️' };
+    return { cor: opp(pj >= 0.5 ? J : B), key: 'REVERSAO_20', nome: 'Retorno à média', emoji: '⚖️' };
   },
   function numMargem({ rows }) {
     const r = rows[0];
     if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
-    return { cor: r.resultado, key: 'NUM_MARGEM_5', nome: `Numérica · margem ${r.pj}×${r.pb}`, emoji: '🔢' };
+    return { cor: r.resultado, key: 'NUM_MARGEM_5', nome: `Margem ${r.pj}×${r.pb}`, emoji: '🔢' };
   },
   function numTendencia({ rows }) {
     const s = rows.slice(0, 6).filter(hasScore);
@@ -347,12 +369,12 @@ const STRATS = [
     const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
     const diff = mj - mb;
     if (Math.abs(diff) < 1.3) return null;
-    return { cor: diff > 0 ? J : B, key: `NUM_TEND_${Math.abs(diff) >= 2 ? 2 : 1}`, nome: `Numérica · média ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📊' };
+    return { cor: diff > 0 ? J : B, key: `NUM_TEND_${Math.abs(diff) >= 2 ? 2 : 1}`, nome: `Tendência ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📊' };
   },
   function doisDoisPar({ seq }) {
     if (seq.length < 3) return null;
     const [a, b, c] = seq.map((x) => x.resultado);
-    if (a !== b && b === c) return { cor: a, key: 'DOIS_DOIS_PAR', nome: '2+2 (completa par)', emoji: '♟️' };
+    if (a !== b && b === c) return { cor: a, key: 'DOIS_DOIS_PAR', nome: '2+2 (par)', emoji: '♟️' };
     return null;
   },
   function numAlta({ rows }) {
@@ -360,13 +382,13 @@ const STRATS = [
     if (!r || !isCol(r.resultado) || !hasScore(r)) return null;
     const v = r.resultado === J ? r.pj : r.pb;
     if (v < 10 || margem(r) < 1) return null;
-    return { cor: r.resultado, key: 'NUM_ALTA_10', nome: `Numérica Alta (${v})`, emoji: '🔢' };
+    return { cor: r.resultado, key: 'NUM_ALTA_10', nome: `Alta (${v})`, emoji: '🔢' };
   },
   function numDiff4({ seq }) {
     if (seq.length < 3) return null;
     const t = seq.slice(0, 3);
     if (!t.every((r) => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
-    return { cor: t[0].resultado, key: 'NUM_DIFF4_X3', nome: 'Numérica Diff≥4 x3', emoji: '🔢' };
+    return { cor: t[0].resultado, key: 'NUM_DIFF4_X3', nome: 'Diff≥4 x3', emoji: '🔢' };
   },
   function numViradaBaixa({ seq }) {
     if (seq.length < 2) return null;
@@ -374,7 +396,7 @@ const STRATS = [
     if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null;
     const sc = (r) => (r.resultado === J ? r.pj : r.pb);
     if (sc(a) > 5 || sc(b) > 5) return null;
-    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Numérica Virada Baixa', emoji: '🔢' };
+    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada Baixa', emoji: '🔢' };
   },
   function contexto({ seq }) {
     const out = [];
@@ -383,14 +405,14 @@ const STRATS = [
       const p = seq.slice(0, k).map((x) => (x.resultado === J ? 'J' : 'B')).join('');
       const vis = p.split('').reverse().join('');
       const last = seq[0].resultado;
-      out.push({ cor: last, key: `CTX${k}_${p}_SEG`, nome: `Sequência ${vis} → segue`, emoji: '🧬' });
-      out.push({ cor: opp(last), key: `CTX${k}_${p}_CON`, nome: `Sequência ${vis} → contraria`, emoji: '🧬' });
+      out.push({ cor: last, key: `CTX${k}_${p}_SEG`, nome: `${vis} segue`, emoji: '🧬' });
+      out.push({ cor: opp(last), key: `CTX${k}_${p}_CON`, nome: `${vis} contra`, emoji: '🧬' });
     }
     return out;
   },
   function numPosEmpate({ rows, seq }) {
     if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
-    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate (cor anterior)', emoji: '🎯' };
+    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯' };
   }
 ];
 
@@ -458,6 +480,8 @@ function getStats(force = false) {
   return S.stats;
 }
 
+/* ============================ ESTATÍSTICA ============================ */
+
 function wilsonLB(w, n, z = 1.96) {
   if (!n) return 0;
   const p = w / n;
@@ -465,6 +489,11 @@ function wilsonLB(w, n, z = 1.96) {
   const c = p + z2 / (2 * n);
   const m = z * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n));
   return (c - m) / (1 + z2 / n);
+}
+
+// Âncora de CONFIANÇA: Wilson a 99.5% (z = 2.58). Muito conservador.
+function anchorRate(w, n) {
+  return wilsonLB(w, n, 2.58) * 100;
 }
 
 function suspensoAoVivo(key) {
@@ -475,114 +504,111 @@ function suspensoAoVivo(key) {
 
 /* ============================ CONFIANÇA MULTI-FATOR ============================ */
 
-function computeConfidence(strat, stats) {
-  // A âncora é o limite inferior de Wilson do backtest com Gale 1
-  const anchor = strat.piso;
-
+function computeConfidence(strat) {
+  const anchor = strat.piso99;
   const mods = [];
   const add = (name, delta) => { if (delta) mods.push({ name, delta }); };
 
-  // 1. Consenso entre estratégias
-  if (strat.consenso >= 4) add('consenso_forte', 1.5);
-  else if (strat.consenso >= 2) add('consenso', 0.8);
+  if (strat.amostra >= 400 && strat.consenso >= 3) add('evidencia_excecional', 1.5);
+  else if (strat.amostra >= 250 && strat.consenso >= 2) add('evidencia_forte', 0.8);
+  else if (strat.amostra >= 300) add('evidencia_ok', 0.4);
 
-  // 2. Tamanho da amostra
-  if (strat.amostra >= 500) add('amostra_forte', 1.2);
-  else if (strat.amostra >= 250) add('amostra_ok', 0.6);
-  else if (strat.amostra < 80) add('amostra_baixa', -2);
+  if (strat.testeN >= 60 && strat.testeTaxa >= strat.taxa - 2) add('holdout_forte', 1.2);
+  else if (strat.testeN >= 30 && strat.testeTaxa >= strat.taxa - 5) add('holdout_ok', 0.6);
 
-  // 3. Holdout concordante
-  if (strat.testeN >= 30 && strat.testeTaxa >= strat.taxa - 3) add('holdout_ok', 1);
-  else if (strat.testeN >= 15 && strat.testeTaxa < strat.taxa - 15) add('holdout_fraca', -3);
-
-  // 4. Desempenho ao vivo desta estratégia (últimos 8 sinais fechados)
-  const recentLive = S.signals.filter((s) => s.key === strat.key && FECHADOS.includes(s.estado)).slice(-8);
-  if (recentLive.length >= 4) {
-    const rate = recentLive.filter((s) => s.estado !== 'LOSS').length / recentLive.length;
-    if (rate >= 0.9) add('ao_vivo_forte', 1);
-    else if (rate < 0.6) add('ao_vivo_fraca', -5);
+  const live = S.signals.filter((s) => s.key === strat.key && FECHADOS.includes(s.estado)).slice(-8);
+  if (live.length >= 6) {
+    const wins = live.filter((s) => s.estado !== 'LOSS').length;
+    if (wins === live.length) add('ao_vivo_perfeito', 1.2);
+    else if (wins / live.length >= 0.875) add('ao_vivo_forte', 0.6);
   }
 
-  // 5. Vantagem sobre a taxa-base
-  const baseRate = stats.baseRate != null ? stats.baseRate * 100 : 0;
-  const edge = strat.taxa - baseRate;
-  if (edge >= 15) add('edge_forte', 0.8);
-  else if (edge < 5) add('edge_fraca', -1);
-
-  const total = anchor + mods.reduce((a, m) => a + m.delta, 0);
-  const score = Math.round(Math.max(0, Math.min(99, total)) * 10) / 10;
-
-  return { score, anchor: Math.round(anchor * 10) / 10, mods };
+  const total = Math.min(100, anchor + mods.reduce((a, m) => a + m.delta, 0));
+  return { score: Math.round(total * 10) / 10, anchor: Math.round(anchor * 10) / 10, mods };
 }
 
 function dynamicThreshold() {
-  if (!CFG.streakAdjust) return CFG.minConfianca;
-  const last5 = S.signals.filter((s) => FECHADOS.includes(s.estado)).slice(-5);
-  if (last5.length < 3) return CFG.minConfianca;
-  const last3 = last5.slice(-3);
+  const base = CFG.minConfianca;
+  if (!CFG.streakAdjust) return base;
+  const fin = S.signals.filter((s) => FECHADOS.includes(s.estado)).slice(-5);
+  if (fin.length < 3) return base;
+  const last3 = fin.slice(-3);
   const losses = last3.filter((s) => s.estado === 'LOSS').length;
-  if (losses >= 3) return Math.min(99, CFG.minConfianca + 3);
-  if (losses >= 2) return Math.min(99, CFG.minConfianca + 1);
-  return CFG.minConfianca;
+  if (losses >= 3) return Math.min(CFG.confiancaMax, base + 4);
+  if (losses >= 2) return Math.min(CFG.confiancaMax, base + 2);
+  return base;
 }
 
-/* ============================ SELEÇÃO ============================ */
+/* ============================ SELEÇÃO (GATES DUROS) ============================ */
 
 function pickEntry(rows, stats) {
-  const todos = runStrategies(rows)
-    .map((c) => {
-      const e = stats.per[c.key] || { n: 0, w: 0, nt: 0, wt: 0 };
-      const taxa = e.n ? (e.w / e.n) * 100 : 0;
-      const piso = wilsonLB(e.w, e.n) * 100;
-      const nTreino = e.n - e.nt;
-      const pisoTreino = nTreino > 0 ? wilsonLB(e.w - e.wt, nTreino) * 100 : 0;
-      return {
-        ...c,
-        amostra: e.n,
-        taxa,
-        piso,
-        pisoTreino,
-        testeN: e.nt,
-        testeTaxa: e.nt ? (e.wt / e.nt) * 100 : 0
-      };
-    })
-    .filter((c) => !suspensoAoVivo(c.key));
+  const minimo = dynamicThreshold();
+  const baseRate = stats.baseRate != null ? stats.baseRate * 100 : 0;
+
+  const candidatos = runStrategies(rows).map((c) => {
+    const e = stats.per[c.key] || { n: 0, w: 0, nt: 0, wt: 0 };
+    const nTreino = e.n - e.nt;
+    const wTreino = e.w - e.wt;
+    return {
+      ...c,
+      amostra: e.n,
+      vitorias: e.w,
+      taxa: e.n ? (e.w / e.n) * 100 : 0,
+      piso99: anchorRate(e.w, e.n),
+      pisoTreino99: nTreino > 0 ? anchorRate(wTreino, nTreino) : 0,
+      testeN: e.nt,
+      testeTaxa: e.nt ? (e.wt / e.nt) * 100 : 0,
+      nTreino, wTreino
+    };
+  });
 
   const porCor = { [J]: [], [B]: [] };
-  for (const c of todos) porCor[c.cor].push(c);
+  for (const c of candidatos) porCor[c.cor].push(c);
 
-  const finalistas = [];
+  const aprovados = [];
+
   for (const cor of [J, B]) {
-    const arr = porCor[cor].filter((c) => c.amostra >= CFG.minAmostra);
-    if (!arr.length) continue;
-    arr.sort((a, b) => b.pisoTreino - a.pisoTreino || b.amostra - a.amostra);
-    const top = arr[0];
-    const conf = computeConfidence({ ...top, consenso: arr.length }, stats);
-    finalistas.push({
+    const arr = porCor[cor];
+
+    const validos = arr.filter((c) => {
+      if (c.amostra < CFG.minAmostra) return false;
+      if (suspensoAoVivo(c.key)) return false;
+      if (c.testeN < 30) return false;
+      if (c.testeTaxa < c.piso99 - 2) return false;
+      if (c.piso99 < minimo - 4) return false;
+      if (c.taxa - baseRate < 8) return false;
+      return true;
+    });
+
+    if (!validos.length) continue;
+
+    validos.sort((a, b) => b.pisoTreino99 - a.pisoTreino99 || b.amostra - a.amostra);
+    const top = validos[0];
+
+    const consenso = validos.filter(
+      (c) => c.cor === top.cor && Math.abs(c.pisoTreino99 - top.pisoTreino99) < 5
+    ).length;
+
+    const conf = computeConfidence({ ...top, consenso });
+
+    if (conf.score < minimo) continue;
+    if (consenso < 2 && conf.score < 92) continue;
+
+    aprovados.push({
       ...top,
-      consenso: arr.length,
+      consenso,
       confianca: conf.score,
       confiancaAnchor: conf.anchor,
       confiancaMods: conf.mods
     });
   }
 
-  if (!finalistas.length) return null;
-  finalistas.sort((a, b) => b.confianca - a.confianca);
-  const best = finalistas[0];
-  const minimo = dynamicThreshold();
-
-  if (best.confianca < minimo) {
-    return {
-      skip: true,
-      motivo: 'confianca_abaixo',
-      confianca: best.confianca,
-      minimo,
-      cor: best.cor,
-      key: best.key
-    };
+  if (!aprovados.length) {
+    return { skip: true, motivo: 'sem_sinal_qualificado', minimo };
   }
-  return best;
+
+  aprovados.sort((a, b) => b.confianca - a.confianca);
+  return aprovados[0];
 }
 
 /* ============================ BASE DE DADOS ============================ */
@@ -632,8 +658,7 @@ async function loadFromDB() {
   const m = Number(mx.rows[0].m);
   S.nextId = m > 0 ? m + 1 : CFG.sinalInicial;
 
-  // Segurança de arranque: sinais pendentes órfãos (>2h) viram CANCELADO.
-  // Isto NÃO é expiração — é limpeza de estado após crash/restart.
+  // Pendentes órfãos após crash/restart (>2h) — limpeza de estado, NÃO é expiração.
   for (const s of S.signals) {
     if (s.estado === 'PENDENTE' && (Date.now() - s.criadoMs) > 2 * 60 * 60 * 1000) {
       s.estado = 'CANCELADO';
@@ -736,7 +761,7 @@ const kick = () => { if (!tgRunning) tgRun().catch((e) => { tgRunning = false; l
 const tgSend = (text, onId) => { tgQueue.push({ kind: 'send', text, onId, tries: 0, plain: false }); R.telegramPendentes = tgQueue.length; kick(); };
 const tgApagarGale = (sig) => { tgQueue.push({ kind: 'delete', sig }); kick(); };
 
-/* ============================ MENSAGENS (novo estilo) ============================ */
+/* ============================ MENSAGENS ============================ */
 
 function placar() {
   const hoje = dia();
@@ -761,6 +786,7 @@ const rodapeHoje = () => {
 };
 
 function msgEntrada(s) {
+  const nivel = s.confianca >= 95 ? '💎' : s.confianca >= 92 ? '🔥' : '✅';
   return [
     `🎯 <b>SINAL #${String(s.id).padStart(3, '0')}</b>`,
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`,
@@ -769,7 +795,7 @@ function msgEntrada(s) {
     CFG.empateGreen ? '🟡 Empate = Green' : null,
     '',
     `▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬`,
-    `📊 Confiança: <b>${s.confianca.toFixed(1)}%</b>`,
+    `${nivel} Confiança: <b>${s.confianca.toFixed(1)}%</b>`,
     `${s.emoji || '🧠'} ${esc(s.nome)}`,
     s.consenso > 1 ? `🤝 ${s.consenso} padrões alinhados` : null,
     '',
@@ -792,7 +818,7 @@ function msgGreen(s, r) {
   const cab = [];
   if (s.estado === 'EMPATE') {
     cab.push(`🟡✅ <b>GREEN · EMPATE · #${String(s.id).padStart(3, '0')}</b>`, '');
-    cab.push(`Empate na entrada`);
+    cab.push('Empate na entrada');
     if (r.mult) cab.push(`🎰 Multiplicador: ×${String(r.mult).replace(/^x/i, '')}`);
   } else if (s.estado === 'GREEN') {
     cab.push(`✅ <b>GREEN · #${String(s.id).padStart(3, '0')}</b>`, '');
@@ -837,7 +863,6 @@ function resolver(r) {
   if (!s) return false;
   if (r.t <= s.baseT || r.id === s.baseId) return false;
 
-  // Empate conta como Green (na entrada ou no Gale)
   if (r.resultado === E && CFG.empateGreen) {
     s.empateGale = s.gale;
     s.empateMult = r.mult ?? null;
@@ -845,13 +870,11 @@ function resolver(r) {
     return true;
   }
 
-  // Cor certa (entrada ou Gale)
   if (r.resultado === s.cor) {
     fechar(s, r, s.gale === 0 ? 'GREEN' : `G${s.gale}`);
     return true;
   }
 
-  // Cor errada — se ainda cabe Gale, abre Gale 1
   if (s.gale < MAX_GALE) {
     s.gale += 1;
     dbSaveSignal(s);
@@ -859,7 +882,6 @@ function resolver(r) {
     return false;
   }
 
-  // Cor errada e Gale esgotado → RED
   s.estado = 'LOSS';
   s.resultadoFinal = r.resultado;
   s.resolvidoMs = Date.now();
@@ -877,15 +899,14 @@ function criarSinal(ultima, override = false) {
   const entry = pickEntry(rows, stats);
 
   if (!entry || entry.skip) {
-    if (entry?.skip) {
-      R.ultimaConfiancaBloqueada = {
-        confianca: entry.confianca, minimo: entry.minimo,
-        cor: entry.cor, key: entry.key, hora: hora()
-      };
-      R.ultimoMotivo = `confianca_${entry.confianca}<${entry.minimo}`;
-    } else {
-      R.ultimoMotivo = 'sem_padrao_elegivel';
-    }
+    R.ultimaConfiancaBloqueada = {
+      confianca: entry?.confianca ?? null,
+      minimo: entry?.minimo ?? CFG.minConfianca,
+      cor: entry?.cor ?? null,
+      key: entry?.key ?? null,
+      hora: hora()
+    };
+    R.ultimoMotivo = entry?.motivo || 'sem_sinal_qualificado';
     if (!override) return null;
     if (!entry || !entry.cor) return null;
   }
@@ -899,7 +920,7 @@ function criarSinal(ultima, override = false) {
     nome: e.nome,
     emoji: e.emoji,
     confianca: e.confianca,
-    assertividade: Math.floor(e.confianca),
+    assertividade: Math.round(e.confianca),
     taxa: Math.round(e.taxa),
     amostra: e.amostra,
     consenso: e.consenso,
@@ -946,25 +967,64 @@ function tentarSlot() {
   catch (e) { R.ultimoMotivo = `erro_criar_sinal: ${e.message}`; log('ERRO_SINAL', e.message); }
 }
 
-/* ============================ KEEP-ALIVE ============================ */
+/* ============================ KEEP-ALIVE ROBUSTO ============================ */
 
-const SELF_URL = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
-let keepTimer = null;
+const SELF_URL = (process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+const HC_URL = (process.env.HEALTHCHECK_URL || '').replace(/\/+$/, '');
+
+async function pingSelf() {
+  if (!SELF_URL) return;
+  try {
+    const r = await axios.get(`${SELF_URL}/health`, {
+      timeout: 20000,
+      headers: { 'User-Agent': 'CapungaKeepAlive/12' }
+    });
+    if (r.status === 200) {
+      R.ultimoKeepAlive = new Date().toISOString();
+      R.keepAliveFails = 0;
+      R.keepAliveOk = true;
+    }
+  } catch (e) {
+    R.keepAliveFails += 1;
+    R.keepAliveOk = false;
+    log('KEEPALIVE_ERRO', { n: R.keepAliveFails, msg: e.message });
+    if (R.keepAliveFails >= 3) await sleep(5000);
+  }
+}
+
+async function pingHealthcheck() {
+  if (!HC_URL) return;
+  try {
+    await axios.get(HC_URL, { timeout: 15000 });
+    R.hcOk = true;
+  } catch (e) {
+    R.hcOk = false;
+    log('HEALTHCHECK_ERRO', e.message);
+  }
+}
 
 function startKeepAlive() {
+  const selfMs = num('KEEPALIVE_MS', 240000, 60000, 800000);
+  const hcMs = num('HEALTHCHECK_MS', 300000, 60000, 800000);
+
   if (!SELF_URL) {
-    log('KEEPALIVE', 'SELF_URL/RENDER_EXTERNAL_URL ausente — configure para evitar sleep no Render');
-    return;
+    log('KEEPALIVE', '⚠️  SELF_URL/RENDER_EXTERNAL_URL ausente → Render vai dormir.');
+    log('KEEPALIVE', '    Define SELF_URL=https://<teu-servico>.onrender.com nas Env Vars.');
+  } else {
+    setImmediate(() => { pingSelf().catch(() => {}); });
+    keepTimer = setInterval(pingSelf, selfMs);
+    if (typeof keepTimer.unref === 'function') keepTimer.unref();
+    log('KEEPALIVE', { modo: 'self-ping', alvo: `${SELF_URL}/health`, intervaloMs: selfMs });
   }
-  const alvo = `${SELF_URL.replace(/\/+$/, '')}/health`;
-  const ms = num('KEEPALIVE_MS', 240000, 60000, 840000);
-  keepTimer = setInterval(() => {
-    axios.get(alvo, { timeout: 15000 })
-      .then(() => { R.ultimoKeepAlive = new Date().toISOString(); })
-      .catch((e) => log('KEEPALIVE_ERRO', e.message));
-  }, ms);
-  if (typeof keepTimer.unref === 'function') keepTimer.unref();
-  log('KEEPALIVE', { alvo, ms });
+
+  if (HC_URL) {
+    setImmediate(() => { pingHealthcheck().catch(() => {}); });
+    hcTimer = setInterval(pingHealthcheck, hcMs);
+    if (typeof hcTimer.unref === 'function') hcTimer.unref();
+    log('HEALTHCHECK', { alvo: HC_URL, intervaloMs: hcMs });
+  } else {
+    log('HEALTHCHECK', 'sem HEALTHCHECK_URL (recomendado: https://healthchecks.io)');
+  }
 }
 
 /* ============================ ROTAS ============================ */
@@ -1006,7 +1066,7 @@ app.post('/webhook/rodada', async (req, res) => {
 
 app.get('/', (_req, res) =>
   res.json({
-    nome: 'Capunga Dados — Bac Bo v11',
+    nome: 'Capunga Dados — Bac Bo v12',
     estado: 'online',
     horaAngola: hora(),
     fontes: { api: Boolean(API_BACBO), webhook: true },
@@ -1035,6 +1095,14 @@ app.get('/health', (_req, res) =>
     erroDB: R.erroDB,
     telegramPendentes: R.telegramPendentes,
     ultimoKeepAlive: R.ultimoKeepAlive,
+    keepAlive: {
+      selfUrl: Boolean(SELF_URL),
+      healthcheckUrl: Boolean(HC_URL),
+      ultimo: R.ultimoKeepAlive,
+      ok: R.keepAliveOk,
+      fails: R.keepAliveFails,
+      hc: R.hcOk
+    },
     fontesAtivas: { api: Boolean(API_BACBO), webhook: true }
   })
 );
@@ -1085,17 +1153,17 @@ app.get('/estatisticas', (_req, res) => {
     .map(([key, v]) => ({
       key, amostras: v.n,
       acertoPercent: Number(((v.w / v.n) * 100).toFixed(1)),
-      pisoWilsonPercent: Number((wilsonLB(v.w, v.n) * 100).toFixed(1)),
+      pisoWilson995: Number(anchorRate(v.w, v.n).toFixed(1)),
       testeAmostras: v.nt,
       testeAcertoPercent: v.nt ? Number(((v.wt / v.nt) * 100).toFixed(1)) : null,
       elegivel: v.n >= CFG.minAmostra
     }))
-    .sort((a, b) => b.pisoWilsonPercent - a.pisoWilsonPercent)
+    .sort((a, b) => b.pisoWilson995 - a.pisoWilson995)
     .slice(0, 60);
   res.json({
     sucesso: true, placarDia: placar(),
     taxaBaseGale1Percent: st.baseRate ? Number((st.baseRate * 100).toFixed(1)) : null,
-    aviso: 'Confiança interna = expectativa de acerto com Gale 1 (multi-fator). Histórico não é garantia.',
+    aviso: 'Confiança = limite inferior de Wilson a 99.5% (com Gale 1). Não é garantia de resultado.',
     backtest: bt, ao_vivo_por_estrategia: aoVivo
   });
 });
@@ -1116,7 +1184,7 @@ app.post('/admin/forcar-sinal', admin, (req, res) => {
 
 app.post('/admin/telegram-teste', admin, async (_req, res) => {
   const r = await tgCall('sendMessage', {
-    text: `🎯 <b>CAPUNGA · BAC BO v11</b>\n✅ Ligação Telegram OK\n🕒 ${hora()}\n🛡 Gale 1 · Confiança mínima ${CFG.minConfianca}%`,
+    text: `🎯 <b>CAPUNGA · BAC BO v12</b>\n✅ Ligação Telegram OK\n🕒 ${hora()}\n🛡 Gale 1 · Confiança mínima ${CFG.minConfianca}%`,
     parse_mode: 'HTML'
   });
   res.status(r.ok ? 200 : 502).json({ sucesso: r.ok, erro: R.erroTelegram });
@@ -1170,19 +1238,19 @@ async function start() {
   syncFromAPI().catch(() => {});
   if (S.hist.length >= 15) getStats(true);
 
-  if (CFG.syncMs > 0) {
-    syncTimer = setInterval(() => { syncFromAPI().catch(() => {}); }, CFG.syncMs);
-  }
+  if (CFG.syncMs > 0) scheduleSync();
   slotTimer = setInterval(tentarSlot, 1000);
+  if (typeof slotTimer.unref === 'function') slotTimer.unref();
   startKeepAlive();
 }
 
 async function shutdown() {
   if (stopping) return;
   stopping = true;
-  if (syncTimer) clearInterval(syncTimer);
+  if (syncTimer) clearTimeout(syncTimer);
   if (slotTimer) clearInterval(slotTimer);
   if (keepTimer) clearInterval(keepTimer);
+  if (hcTimer) clearInterval(hcTimer);
   try { await dbChain; } catch (_) {}
   if (server) await new Promise((r) => server.close(r));
   if (pool) await pool.end().catch(() => {});
