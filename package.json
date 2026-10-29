@@ -1,42 +1,21 @@
 {
-  "name": "football-studio-signals",
-  "version": "1.1.0",
-  "description": "Servidor de sinais para Football Studio (Evolution) com polling de APIs públicas, webhook fallback, Martingale e Telegram.",
+  "name": "capunga-bacbo",
+  "version": "3.1.0",
+  "description": "CAPUNGA - Robô de sinais Bac Bo Brasileiro",
   "main": "server.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
-    "check": "node --check server.js",
-    "test:source": "node -e \"require('dotenv').config(); console.log('SOURCES:', process.env.SOURCE_PRIORITY || 'casinoscores,tracksino,generic')\""
+    "dev": "node server.js"
   },
-  "keywords": [
-    "football-studio",
-    "evolution",
-    "signals",
-    "casino",
-    "martingale",
-    "telegram",
-    "postgres"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
-    "axios": "^1.7.7",
-    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "pg": "^8.12.0"
+    "express": "^4.21.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
-  "devDependencies": {},
-  "repository": {
-    "type": "git",
-    "url": ""
+  "engines": {
+    "node": ">=18"
   },
-  "bugs": {
-    "url": ""
-  },
-  "homepage": ""
+  "private": true
 }
