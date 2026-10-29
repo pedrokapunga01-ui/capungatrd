@@ -582,15 +582,27 @@ function processResult({ round, side, silent = false }) {
 
   // Novo sinal
   if (!silent && !state.stopped && !state.pendingSignal) {
-    const consensus = computeConsensus(runAnalyzers());
+    const now = Date.now();
+    // Passou a espera máxima sem sinal? Então relaxa as exigências (1 analisador basta)
+    const waited = now - Math.max(state.lastSignalTs || 0, BOOT_TS);
+    const relaxed = CONFIG.MAX_WAIT_MS > 0 && waited >= CONFIG.MAX_WAIT_MS;
+
+    let consensus = computeConsensus(runAnalyzers());
+    let noPattern = false;
+    if (!consensus && relaxed) {
+      // Nenhum analisador achou padrão, mas a espera máxima passou:
+      // usa a regra mais simples (contra a última cor que não foi empate)
+      const last = [...state.history].reverse().find(h => h.side !== 'T');
+      if (last) {
+        consensus = { bet: last.side === 'B' ? 'P' : 'B', ratio: 0.5, agreeing: [], disagreeing: [] };
+        noPattern = true;
+      }
+    }
+
     if (consensus) {
-      const now = Date.now();
       const cooled = CONFIG.COOLDOWN_MS === 0 || now - state.lastSignalTs >= CONFIG.COOLDOWN_MS;
       if (cooled) {
-        // Passou a espera máxima sem sinal? Então relaxa as exigências (1 analisador basta)
-        const waited = now - Math.max(state.lastSignalTs || 0, BOOT_TS);
-        const relaxed = CONFIG.MAX_WAIT_MS > 0 && waited >= CONFIG.MAX_WAIT_MS;
-        const score = computeScore(consensus, relaxed ? 1 : CONFIG.MIN_AGREEMENT);
+        const score = noPattern ? 0 : computeScore(consensus, relaxed ? 1 : CONFIG.MIN_AGREEMENT);
         if (score >= CONFIG.MIN_CONFIDENCE || relaxed) {
           const reduced = score < CONFIG.MIN_CONFIDENCE;
           state.pendingSignal = {
@@ -601,13 +613,13 @@ function processResult({ round, side, silent = false }) {
           };
           state.lastSignalTs = now;
           state.totalSignals++;
-          info.signal = { bet: consensus.bet, score, reduced };
+          info.signal = { bet: consensus.bet, score, reduced, noPattern };
 
           notify(
             `🚨 <b>${BRAND}</b> 🚨\n` +
             `🎯 <b>SINAL BAC BO</b>\n` +
             `➡️ Entrada: <b>${tgLabel(consensus.bet)}</b>\n` +
-            `💯 Força do sinal: <b>${score}/100</b>${reduced ? ' (abaixo do normal)' : ''}\n` +
+            `💯 Força do sinal: ${noPattern ? '<b>sem padrão claro</b>' : `<b>${score}/100</b>${reduced ? ' (abaixo do normal)' : ''}`}\n` +
             `📊 Hoje: ${fmtRecord(state.wins, state.losses)}` +
             (CONFIG.DISCLAIMER ? `\n\n${esc(CONFIG.DISCLAIMER)}` : '')
           );
