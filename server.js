@@ -35,13 +35,24 @@ const envBool = (key, def = false) => {
   return ['1', 'true', 'yes', 'sim', 'on'].includes(String(v).trim().toLowerCase());
 };
 
+// Lê a primeira variável definida de uma lista de nomes alternativos
+const envFirst = (keys, def = '') => {
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v !== undefined && String(v).trim() !== '') return String(v).trim();
+  }
+  return def;
+};
+const TOKEN_KEYS   = ['TELEGRAM_TOKEN', 'BOT_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TOKEN'];
+const CHAT_ID_KEYS = ['TELEGRAM_CHAT_ID', 'CHAT_ID', 'TELEGRAM_CHAT', 'CHANNEL_ID'];
+
 const DEFAULT_DISCLAIMER =
   '⚠️ Jogo de azar: não há garantia de resultado. Aposte com responsabilidade. +18';
 const rawDisclaimer = process.env.DISCLAIMER;
 
 const CONFIG = {
-  TELEGRAM_TOKEN:   env('TELEGRAM_TOKEN'),
-  TELEGRAM_CHAT_ID: env('TELEGRAM_CHAT_ID'),
+  TELEGRAM_TOKEN:   envFirst(TOKEN_KEYS),
+  TELEGRAM_CHAT_ID: envFirst(CHAT_ID_KEYS),
   ADMIN_IDS: new Set(
     env('ADMIN_ID').split(',').map(s => s.trim()).filter(s => s && s !== '0')
   ),
@@ -62,6 +73,9 @@ const CONFIG = {
   MIN_AGREEMENT:    envNum('MIN_AGREEMENT', 3),
   COOLDOWN_MS:      envNum('COOLDOWN_MS', 0),
   PENDING_TTL_MS:   envNum('PENDING_TTL_MS', 10 * 60 * 1000),
+  // Espera máxima sem sinal. Passado este tempo, aceita o melhor sinal disponível
+  // (mesmo abaixo de MIN_CONFIDENCE/MIN_AGREEMENT). 0 desativa.
+  MAX_WAIT_MS:      envNum('MAX_WAIT_MS', 4 * 60 * 1000),
 
   DATA_DIR:         env('DATA_DIR', __dirname),
   ANNOUNCE_ONLINE:  envBool('ANNOUNCE_ONLINE', false), // aviso "online" no canal
@@ -77,6 +91,7 @@ const BRAND = 'CAPUNGA';
 const VERSION = '3.2';
 const MAX_HISTORY = 120;
 const MAX_PROCESSED = 800;
+const BOOT_TS = Date.now();
 
 /* =============================================================
    LOGS
@@ -94,10 +109,10 @@ const log = {
 (function validateConfig() {
   const problems = [];
   if (!CONFIG.TELEGRAM_TOKEN || !CONFIG.TELEGRAM_TOKEN.includes(':')) {
-    problems.push('TELEGRAM_TOKEN ausente ou inválido');
+    problems.push('Token do bot ausente ou inválido (use TELEGRAM_TOKEN ou BOT_TOKEN)');
   }
   if (!CONFIG.TELEGRAM_CHAT_ID) {
-    problems.push('TELEGRAM_CHAT_ID ausente');
+    problems.push('Chat ID ausente (use TELEGRAM_CHAT_ID ou CHAT_ID)');
   }
   if (!CONFIG.WEBHOOK_SECRET) {
     problems.push('WEBHOOK_SECRET ausente (defina um segredo longo e aleatório)');
@@ -450,8 +465,8 @@ function computeConsensus(analyzers) {
 }
 
 // Pontuação interna 0-100 (heurística). NÃO é uma probabilidade de acerto.
-function computeScore(consensus) {
-  if (consensus.agreeing.length < CONFIG.MIN_AGREEMENT) return 0;
+function computeScore(consensus, minAgree = CONFIG.MIN_AGREEMENT) {
+  if (consensus.agreeing.length < minAgree) return 0;
 
   let score = 0;
   score += consensus.ratio * 25;
@@ -569,25 +584,30 @@ function processResult({ round, side, silent = false }) {
   if (!silent && !state.stopped && !state.pendingSignal) {
     const consensus = computeConsensus(runAnalyzers());
     if (consensus) {
-      const cooled = CONFIG.COOLDOWN_MS === 0 || Date.now() - state.lastSignalTs >= CONFIG.COOLDOWN_MS;
+      const now = Date.now();
+      const cooled = CONFIG.COOLDOWN_MS === 0 || now - state.lastSignalTs >= CONFIG.COOLDOWN_MS;
       if (cooled) {
-        const score = computeScore(consensus);
-        if (score >= CONFIG.MIN_CONFIDENCE) {
+        // Passou a espera máxima sem sinal? Então relaxa as exigências (1 analisador basta)
+        const waited = now - Math.max(state.lastSignalTs || 0, BOOT_TS);
+        const relaxed = CONFIG.MAX_WAIT_MS > 0 && waited >= CONFIG.MAX_WAIT_MS;
+        const score = computeScore(consensus, relaxed ? 1 : CONFIG.MIN_AGREEMENT);
+        if (score >= CONFIG.MIN_CONFIDENCE || relaxed) {
+          const reduced = score < CONFIG.MIN_CONFIDENCE;
           state.pendingSignal = {
             bet: consensus.bet,
             score,
             analyzers: consensus.agreeing.map(a => a.name),
-            ts: Date.now(),
+            ts: now,
           };
-          state.lastSignalTs = Date.now();
+          state.lastSignalTs = now;
           state.totalSignals++;
-          info.signal = { bet: consensus.bet, score };
+          info.signal = { bet: consensus.bet, score, reduced };
 
           notify(
             `🚨 <b>${BRAND}</b> 🚨\n` +
             `🎯 <b>SINAL BAC BO</b>\n` +
             `➡️ Entrada: <b>${tgLabel(consensus.bet)}</b>\n` +
-            `💯 Força do sinal: <b>${score}/100</b>\n` +
+            `💯 Força do sinal: <b>${score}/100</b>${reduced ? ' (abaixo do normal)' : ''}\n` +
             `📊 Hoje: ${fmtRecord(state.wins, state.losses)}` +
             (CONFIG.DISCLAIMER ? `\n\n${esc(CONFIG.DISCLAIMER)}` : '')
           );
