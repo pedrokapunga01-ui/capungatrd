@@ -1,20 +1,24 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v10 FINAL
+ * CAPUNGA DADOS — BAC BO · v11
  *
- *  • 24/7: keep-alive agressivo (60s) + wake-detection (auto-recover se dormir).
+ *  • 24/7: keep-alive (60s) + wake-detection (auto-recover se dormir).
  *  • GALE 1 (máx. 2 tentativas).
  *  • CONFIANÇA COMPOSTA: backtest + live + momento + padrão + atividade + consenso.
- *  • SEM sinal expirado — resolve sempre contra rodadas reais.
+ *  • APURAÇÃO POR RECONCILIAÇÃO (novo na v11):
+ *      - o sinal fica PENDENTE até haver rodadas reais depois dele;
+ *      - a apuração lê o histórico (idempotente), não depende da ordem de chegada;
+ *      - sobrevive a restart: pendentes NÃO são cancelados ao arrancar;
+ *      - buraco real nos dados => NAO_APURADO (não conta como Loss).
  *  • RESET AUTOMÁTICO do histórico quando o ficheiro muda (hash SHA-256) — ou via DEPLOY_ID.
- *  • Estratégias numéricas reais baseadas na tabela de scores (escada, range, espelho,
- *    gatilho, paridade, sequência, margem trend, etc).
+ *    (Defina DEPLOY_ID fixo para NÃO perder os sinais a cada deploy.)
  *
  * ENV obrigatórias: BOT_TOKEN, CHAT_ID
  * ENV opcionais:    DATABASE_URL, ADMIN_TOKEN, SELF_URL/RENDER_EXTERNAL_URL
  *                   MIN_AMOSTRA(60) · SYNC_MS(2000) · SINAL_INICIAL(1) · SINAIS_ATIVOS(true)
  *                   EMPATE_VALE_GREEN(true) · API_BACBO · KEEPALIVE_MS(60000) · DEPLOY_ID
+ *                   APURA_GAP_MS(180000) · APURA_MAX_MS(1200000)
  */
 
 const fs = require('fs');
@@ -52,7 +56,9 @@ const CFG = {
   maxHist: 5000,
   gapMs: 6 * 60 * 1000,
   frescoMs: 4 * 60 * 1000,
-  keepAliveMs: num('KEEPALIVE_MS', 60000, 30000, 300000)
+  keepAliveMs: num('KEEPALIVE_MS', 60000, 30000, 300000),
+  apuraGapMs: num('APURA_GAP_MS', 180000, 60000, 1800000),
+  apuraMaxMs: num('APURA_MAX_MS', 1200000, 300000, 7200000)
 };
 
 const J = 'Jogador';
@@ -101,7 +107,8 @@ const R = {
   telegramPendentes: 0,
   ultimoKeepAlive: null,
   ultimoWake: null,
-  wakes: 0
+  wakes: 0,
+  naoApurados: 0
 };
 
 let pool = null;
@@ -212,7 +219,7 @@ async function fetchRounds() {
     try {
       const resp = await axios.get(API_BACBO, {
         timeout: 15000,
-        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDadosBot/10.0' }
+        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDadosBot/11.0' }
       });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
@@ -733,13 +740,10 @@ async function loadFromDB() {
   const m = Number(mx.rows[0].m);
   S.nextId = m > 0 ? m + 1 : CFG.sinalInicial;
 
-  for (const s of S.signals) {
-    if (s.estado === 'PENDENTE') {
-      s.estado = 'CANCELADO';
-      s.resolvidoMs = Date.now();
-      dbSaveSignal(s);
-    }
-  }
+  // v11: sinais PENDENTES NÃO são cancelados no arranque.
+  // Continuam abertos e são apurados por reconciliar() contra as rodadas reais.
+  const abertos = S.signals.filter((s) => s.estado === 'PENDENTE').length;
+  if (abertos) log('PENDENTES_RETOMADOS', { abertos });
 }
 
 function dbSaveRound(r) {
@@ -870,7 +874,7 @@ function placar() {
   let seguidos = 0;
   const fin = L.filter((s) => FECHADOS.includes(s.estado));
   for (let i = fin.length - 1; i >= 0; i--) { if (fin[i].estado === 'LOSS') break; seguidos++; }
-  return { green, g1, emp, loss, wins, fechados, taxa, seguidos };
+  return { green, g1, emp, loss, wins, fechados, taxa, seguidos, naoApurados: c('NAO_APURADO') };
 }
 
 function msgPlacar(p) {
@@ -972,28 +976,7 @@ function fechar(s, r, estado) {
   log('GREEN', { id: s.id, estado });
 }
 
-function resolver(r) {
-  const s = pendente();
-  if (!s) return false;
-  if (r.t <= (s.baseT || 0) || r.id === s.baseId) return false;
-
-  if (r.resultado === E && CFG.empateGreen) {
-    s.empateGale = s.gale;
-    s.empateMult = r.mult ?? null;
-    fechar(s, r, 'EMPATE');
-    return true;
-  }
-  if (r.resultado === s.cor) {
-    fechar(s, r, s.gale === 0 ? 'GREEN' : 'G1');
-    return true;
-  }
-  if (s.gale < MAX_GALE) {
-    s.gale += 1;
-    dbSaveSignal(s);
-    tgSend(msgGale(s, r), (id) => { (s.galeMsgIds = s.galeMsgIds || []).push(id); });
-    log('GALE', { id: s.id, gale: s.gale });
-    return false;
-  }
+function fecharLoss(s, r) {
   s.estado = 'LOSS';
   s.resultadoFinal = r.resultado;
   s.resolvidoMs = Date.now();
@@ -1001,7 +984,63 @@ function resolver(r) {
   tgSend(msgRed(s, r));
   tgApagarGale(s);
   log('RED', { id: s.id });
-  return true;
+}
+
+function naoApurado(s, motivo) {
+  s.estado = 'NAO_APURADO';
+  s.resolvidoMs = Date.now();
+  R.naoApurados += 1;
+  dbSaveSignal(s);
+  tgSend(`⚪ <b>SINAL #${s.id} NÃO APURADO</b> (falha de dados da mesa)\n<i>Não conta no placar.</i>\n⏱ ${hora()}`);
+  tgApagarGale(s);
+  log('NAO_APURADO', { id: s.id, motivo });
+}
+
+/**
+ * Apuração por reconciliação: olha as rodadas reais depois do sinal
+ * (entrada direta + Gale 1) e decide. Idempotente e independente da
+ * ordem em que as rodadas chegaram da API.
+ */
+function reconciliar() {
+  const s = pendente();
+  if (!s) return;
+
+  const rodadas = S.hist.filter((r) => r.t > (s.baseT || 0) && r.id !== s.baseId);
+  let prevT = s.baseT || 0;
+
+  for (let k = 0; k <= MAX_GALE; k++) {
+    const r = rodadas[k];
+    if (!r) break; // ainda não há rodada: continua pendente
+
+    if (prevT && r.t - prevT > CFG.apuraGapMs) return naoApurado(s, 'buraco_nos_dados');
+    prevT = r.t;
+
+    if (r.resultado === E && CFG.empateGreen) {
+      s.empateGale = k;
+      s.empateMult = r.mult ?? null;
+      return fechar(s, r, 'EMPATE');
+    }
+    if (r.resultado === s.cor) {
+      return fechar(s, r, k === 0 ? 'GREEN' : 'G1');
+    }
+
+    if (k < MAX_GALE) {
+      if (s.gale < k + 1) {
+        s.gale = k + 1;
+        dbSaveSignal(s);
+        // só avisa o Gale se a rodada do gale ainda não saiu
+        if (!rodadas[k + 1]) {
+          tgSend(msgGale(s, r), (id) => { (s.galeMsgIds = s.galeMsgIds || []).push(id); });
+        }
+        log('GALE', { id: s.id, gale: s.gale });
+      }
+      continue;
+    }
+
+    return fecharLoss(s, r);
+  }
+
+  if (Date.now() - s.criadoMs > CFG.apuraMaxMs) naoApurado(s, 'sem_dados_tempo_maximo');
 }
 
 function criarSinal(ultima) {
@@ -1073,16 +1112,17 @@ async function syncOnce() {
 
     for (const r of fresh) {
       S.seen.add(r.id);
-      const eAoVivo = !warm && r.t > lastT;
       if (r.t < lastT) desordem = true;
       S.hist.push(r);
       dbSaveRound(r);
       if (r.t > lastT) lastT = r.t;
-      if (eAoVivo) resolver(r);
     }
 
     if (desordem) S.hist.sort((a, b) => a.t - b.t);
     if (S.hist.length > CFG.maxHist) S.hist.splice(0, S.hist.length - CFG.maxHist);
+
+    // v11: apura SEMPRE contra o histórico, mesmo sem rodadas novas
+    reconciliar();
 
     if (fresh.length) { R.ultimaRodadaNova = new Date().toISOString(); R.ciclosSemNovos = 0; }
     else R.ciclosSemNovos++;
@@ -1116,6 +1156,8 @@ function tick() {
     syncOnce().catch(() => {});
   }
   lastTickMs = now;
+  // garante o timeout de apuração mesmo se a API estiver fora do ar
+  try { reconciliar(); } catch (e) { log('RECONCILIAR_ERRO', e.message); }
   tentarSlot();
 }
 
@@ -1161,7 +1203,7 @@ const proximoSlotEmSeg = () =>
 
 app.get('/', (_req, res) =>
   res.json({
-    nome: 'Capunga Dados — Bac Bo v10 (gale 1 · multi-fator · 24/7)',
+    nome: 'Capunga Dados — Bac Bo v11 (gale 1 · multi-fator · apuração por reconciliação · 24/7)',
     estado: 'online',
     horaAngola: hora(),
     estrategias: STRATS.length,
@@ -1172,7 +1214,8 @@ app.get('/', (_req, res) =>
 
 app.get('/ping', (_req, res) => res.send('ok'));
 
-app.get('/health', (_req, res) =>
+app.get('/health', (_req, res) => {
+  const p = pendente();
   res.json({
     sucesso: true,
     horaAngola: hora(),
@@ -1183,6 +1226,8 @@ app.get('/health', (_req, res) =>
     ciclosSemNovos: R.ciclosSemNovos,
     motivoUltimoSlotSemSinal: R.ultimoMotivo,
     proximoSlotEmSeg: proximoSlotEmSeg(),
+    sinalPendente: p ? { id: p.id, gale: p.gale, idadeSeg: Math.round((Date.now() - p.criadoMs) / 1000) } : null,
+    naoApuradosDesdeInicio: R.naoApurados,
     erroAPI: R.erroAPI,
     erroTelegram: R.erroTelegram,
     erroDB: R.erroDB,
@@ -1190,8 +1235,8 @@ app.get('/health', (_req, res) =>
     ultimoKeepAlive: R.ultimoKeepAlive,
     ultimoWake: R.ultimoWake,
     wakesTotal: R.wakes
-  })
-);
+  });
+});
 
 app.get('/diagnostico', (_req, res) => {
   const st = S.stats || { per: {}, baseRate: null, baseN: 0 };
@@ -1270,7 +1315,7 @@ app.post('/admin/cancelar-sinal', admin, (_req, res) => {
 
 app.post('/admin/telegram-teste', admin, async (_req, res) => {
   const r = await tgCall('sendMessage', {
-    text: `🎲 <b>CAPUNGA · BAC BO v10</b>\n✅ Ligação Telegram OK\n🕒 ${hora()}`,
+    text: `🎲 <b>CAPUNGA · BAC BO v11</b>\n✅ Ligação Telegram OK\n🕒 ${hora()}`,
     parse_mode: 'HTML'
   });
   res.status(r.ok ? 200 : 502).json({ sucesso: r.ok, erro: R.erroTelegram });
