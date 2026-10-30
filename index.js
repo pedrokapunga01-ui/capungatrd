@@ -1,23 +1,19 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v11
+ * CAPUNGA DADOS — BAC BO · v11 (LOCKED TO CASINO.ORG)
  *
+ *  • FONTE DE DADOS ÚNICA E EXCLUSIVA: API Casino.org (Evolution).
  *  • 24/7: keep-alive (60s) + wake-detection (auto-recover se dormir).
  *  • GALE 1 (máx. 2 tentativas).
  *  • CONFIANÇA COMPOSTA: backtest + live + momento + padrão + atividade + consenso.
- *  • APURAÇÃO POR RECONCILIAÇÃO (novo na v11):
- *      - o sinal fica PENDENTE até haver rodadas reais depois dele;
- *      - a apuração lê o histórico (idempotente), não depende da ordem de chegada;
- *      - sobrevive a restart: pendentes NÃO são cancelados ao arrancar;
- *      - buraco real nos dados => NAO_APURADO (não conta como Loss).
- *  • RESET AUTOMÁTICO do histórico quando o ficheiro muda (hash SHA-256) — ou via DEPLOY_ID.
- *    (Defina DEPLOY_ID fixo para NÃO perder os sinais a cada deploy.)
+ *  • APURAÇÃO POR RECONCILIAÇÃO: o sinal fica PENDENTE até haver rodadas reais depois dele.
+ *  • RESET AUTOMÁTICO do histórico quando o ficheiro muda (hash SHA-256).
  *
  * ENV obrigatórias: BOT_TOKEN, CHAT_ID
  * ENV opcionais:    DATABASE_URL, ADMIN_TOKEN, SELF_URL/RENDER_EXTERNAL_URL
  *                   MIN_AMOSTRA(60) · SYNC_MS(2000) · SINAL_INICIAL(1) · SINAIS_ATIVOS(true)
- *                   EMPATE_VALE_GREEN(true) · API_BACBO · KEEPALIVE_MS(60000) · DEPLOY_ID
+ *                   EMPATE_VALE_GREEN(true) · KEEPALIVE_MS(60000) · DEPLOY_ID
  *                   APURA_GAP_MS(180000) · APURA_MAX_MS(1200000)
  */
 
@@ -42,7 +38,9 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
-const API_BACBO = process.env.API_BACBO || 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
+
+// 🚨 TRAVA DE SEGURANÇA: API FIXA NO CASINO.ORG 🚨
+const API_BACBO = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
 
 const MAX_GALE = 1;
 const SLOT_MS = 5 * 60 * 1000;
@@ -326,7 +324,7 @@ const STRATS = [
     return out;
   },
 
-  /* ---------- NUMÉRICAS (tabela dos números) ---------- */
+  /* ---------- NUMÉRICAS ---------- */
   function numEscada({ seq }) {
     if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
     const [a, b, c] = seq.slice(0, 3);
@@ -740,8 +738,6 @@ async function loadFromDB() {
   const m = Number(mx.rows[0].m);
   S.nextId = m > 0 ? m + 1 : CFG.sinalInicial;
 
-  // v11: sinais PENDENTES NÃO são cancelados no arranque.
-  // Continuam abertos e são apurados por reconciliar() contra as rodadas reais.
   const abertos = S.signals.filter((s) => s.estado === 'PENDENTE').length;
   if (abertos) log('PENDENTES_RETOMADOS', { abertos });
 }
@@ -996,11 +992,6 @@ function naoApurado(s, motivo) {
   log('NAO_APURADO', { id: s.id, motivo });
 }
 
-/**
- * Apuração por reconciliação: olha as rodadas reais depois do sinal
- * (entrada direta + Gale 1) e decide. Idempotente e independente da
- * ordem em que as rodadas chegaram da API.
- */
 function reconciliar() {
   const s = pendente();
   if (!s) return;
@@ -1010,8 +1001,7 @@ function reconciliar() {
 
   for (let k = 0; k <= MAX_GALE; k++) {
     const r = rodadas[k];
-    if (!r) break; // ainda não há rodada: continua pendente
-
+    if (!r) break; 
     if (prevT && r.t - prevT > CFG.apuraGapMs) return naoApurado(s, 'buraco_nos_dados');
     prevT = r.t;
 
@@ -1028,7 +1018,6 @@ function reconciliar() {
       if (s.gale < k + 1) {
         s.gale = k + 1;
         dbSaveSignal(s);
-        // só avisa o Gale se a rodada do gale ainda não saiu
         if (!rodadas[k + 1]) {
           tgSend(msgGale(s, r), (id) => { (s.galeMsgIds = s.galeMsgIds || []).push(id); });
         }
@@ -1121,7 +1110,6 @@ async function syncOnce() {
     if (desordem) S.hist.sort((a, b) => a.t - b.t);
     if (S.hist.length > CFG.maxHist) S.hist.splice(0, S.hist.length - CFG.maxHist);
 
-    // v11: apura SEMPRE contra o histórico, mesmo sem rodadas novas
     reconciliar();
 
     if (fresh.length) { R.ultimaRodadaNova = new Date().toISOString(); R.ciclosSemNovos = 0; }
@@ -1156,7 +1144,6 @@ function tick() {
     syncOnce().catch(() => {});
   }
   lastTickMs = now;
-  // garante o timeout de apuração mesmo se a API estiver fora do ar
   try { reconciliar(); } catch (e) { log('RECONCILIAR_ERRO', e.message); }
   tentarSlot();
 }
