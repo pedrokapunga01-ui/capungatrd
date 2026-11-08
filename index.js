@@ -1,21 +1,29 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v11.1 (FIXED)
+ * CAPUNGA DADOS — BAC BO · v12 (SEQUENCIAL + NUMÉRICO)
  *
- * Correções principais:
- * 1. Nunca mais "NÃO APURADO". Após timeout força LOSS. Histórico sempre limpo.
- * 2. Frequência flexível 4m30s–5m30s + atraso mínimo após a última rodada (25-40s).
- *    Impede sinal + green no mesmo instante.
- * 3. Ordem rígida: sync → apurar → gerar sinal.
- * 4. Gale 1 (máx. 2 tentativas). Empate vale green (configurável).
+ * - Fonte exclusiva: API Casino.org (Evolution)
+ * - Frequência \~5 min, mas SÓ gera sinal DEPOIS da rodada terminar + buffer
+ * - NUNCA mais "NÃO APURADO" → timeout força LOSS
+ * - Estratégias prioritárias: sequências + padrões numéricos
+ * - Gale 1 | Empate vale GREEN (configurável)
  *
  * ENV obrigatórias: BOT_TOKEN, CHAT_ID
- * ENV opcionais:    DATABASE_URL, ADMIN_TOKEN, SELF_URL/RENDER_EXTERNAL_URL
- *                   MIN_AMOSTRA(60) · SYNC_MS(2000) · SINAL_INICIAL(1) · SINAIS_ATIVOS(true)
- *                   EMPATE_VALE_GREEN(true) · KEEPALIVE_MS(60000) · DEPLOY_ID
- *                   APURA_GAP_MS(180000) · APURA_MAX_MS(1200000)
- *                   MIN_INTERVAL_MS(270000) · MAX_INTERVAL_MS(330000) · ATRASO_RODADA_MS(30000)
+ * ENV opcionais:
+ *   SINAIS_ATIVOS=true
+ *   EMPATE_VALE_GREEN=true
+ *   MIN_AMOSTRA=60
+ *   SYNC_MS=2000
+ *   MIN_INTERVAL_MS=285000   (4m45s)
+ *   MAX_INTERVAL_MS=330000   (5m30s)
+ *   ATRASO_RODADA_MS=35000   (35s após última rodada)
+ *   APURA_MAX_MS=900000      (15 min)
+ *   KEEPALIVE_MS=60000
+ *   SINAL_INICIAL=1
+ *   ADMIN_TOKEN
+ *   DATABASE_URL
+ *   SELF_URL / RENDER_EXTERNAL_URL
  */
 
 const fs = require('fs');
@@ -40,7 +48,6 @@ const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
-// 🚨 TRAVA DE SEGURANÇA: API FIXA NO CASINO.ORG 🚨
 const API_BACBO =
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
@@ -49,19 +56,16 @@ const MAX_GALE = 1;
 const CFG = {
   ativos: bool(process.env.SINAIS_ATIVOS, true),
   empateGreen: bool(process.env.EMPATE_VALE_GREEN, true),
-  minAmostra: num('MIN_AMOSTRA', 60, 20, 5000),
-  syncMs: num('SYNC_MS', 2000, 1000, 15000),
-  sinalInicial: num('SINAL_INICIAL', 1, 1, 100000000),
-  maxHist: 5000,
-  gapMs: 6 * 60 * 1000,
-  frescoMs: 4 * 60 * 1000,
+  minAmostra: num('MIN_AMOSTRA', 60, 30, 5000),
+  syncMs: num('SYNC_MS', 2000, 1000, 10000),
+  sinalInicial: num('SINAL_INICIAL', 1, 1, 99999999),
+  maxHist: 4000,
+  gapMs: 7 * 60 * 1000,
   keepAliveMs: num('KEEPALIVE_MS', 60000, 30000, 300000),
-  apuraGapMs: num('APURA_GAP_MS', 180000, 60000, 1800000),
-  apuraMaxMs: num('APURA_MAX_MS', 1200000, 300000, 7200000),
-  // NOVO: intervalo flexível + atraso após rodada
-  minIntervalMs: num('MIN_INTERVAL_MS', 270000, 180000, 600000),   // 4m30s
-  maxIntervalMs: num('MAX_INTERVAL_MS', 330000, 240000, 900000),   // 5m30s
-  atrasoRodadaMs: num('ATRASO_RODADA_MS', 30000, 15000, 90000)     // 30s após última rodada
+  apuraMaxMs: num('APURA_MAX_MS', 900000, 300000, 3600000), // 15 min
+  minIntervalMs: num('MIN_INTERVAL_MS', 285000, 240000, 600000), // 4m45s
+  maxIntervalMs: num('MAX_INTERVAL_MS', 330000, 270000, 720000), // 5m30s
+  atrasoRodadaMs: num('ATRASO_RODADA_MS', 35000, 20000, 90000)  // 35s após rodada
 };
 
 const J = 'Jogador';
@@ -69,17 +73,16 @@ const B = 'Banca';
 const E = 'Empate';
 const isCol = (x) => x === J || x === B;
 const opp = (c) => (c === J ? B : c === B ? J : null);
-const FECHADOS = ['GREEN', 'G1', 'EMPATE', 'LOSS'];
+const FECHADOS = new Set(['GREEN', 'G1', 'EMPATE', 'LOSS']);
 
-/* ============================ DEPLOY ID / RESET ============================ */
+/* ============================ DEPLOY ID ============================ */
 
 function calcDeployId() {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
   try {
-    const buf = fs.readFileSync(__filename);
-    return crypto.createHash('sha256').update(buf).digest('hex').slice(0, 16);
+    return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 16);
   } catch {
-    return '';
+    return 'unknown';
   }
 }
 const DEPLOY_ID = calcDeployId();
@@ -103,20 +106,16 @@ const R = {
   ultimaRodadaNova: null,
   ciclosSemNovos: 0,
   erroAPI: null,
-  erroDB: null,
   erroTelegram: null,
   ultimoMotivo: null,
   ultimoSinal: null,
-  telegramPendentes: 0,
-  ultimoKeepAlive: null,
-  ultimoWake: null,
   wakes: 0,
-  naoApurados: 0 // mantido só para log, nunca mais usado como status
+  ultimoWake: null,
+  ultimoKeepAlive: null
 };
 
 let pool = null;
 let server = null;
-let syncTimer = null;
 let tickTimer = null;
 let keepTimer = null;
 let busy = false;
@@ -127,22 +126,15 @@ let lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function log(tag, data) {
-  const p = typeof data === 'string' ? data : JSON.stringify(data);
-  console.log(`[\( {new Date().toISOString()}] [ \){tag}] ${p}`);
+  console.log(`[\( {new Date().toISOString()}] [ \){tag}] ${typeof data === 'string' ? data : JSON.stringify(data)}`);
 }
 
 const fmtHora = new Intl.DateTimeFormat('pt-PT', {
   timeZone: 'Africa/Luanda', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
 });
-const fmtDia = new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Africa/Luanda', year: 'numeric', month: '2-digit', day: '2-digit'
-});
 const hora = (ms = Date.now()) => fmtHora.format(new Date(ms));
-const dia = (ms = Date.now()) => fmtDia.format(new Date(ms));
 
-const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const corTxt = (c) => (c === B ? '🔴 <b>BANCA</b>' : c === J ? '🔵 <b>JOGADOR</b>' : '🟡 <b>EMPATE</b>');
-const corCurta = (c) => (c === B ? '🔴 Banca' : c === J ? '🔵 Jogador' : '🟡 Empate');
 const barra = (p) => {
   const f = Math.max(0, Math.min(10, Math.round(p / 10)));
   return '▰'.repeat(f) + '▱'.repeat(10 - f);
@@ -155,8 +147,8 @@ function normalizeOutcome(v) {
   const s = String(v ?? '')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .trim().toLowerCase().replace(/[\s_-]+/g, '');
-  if (['player', 'jogador', 'playerwin', 'playerwins', 'playerwon', 'playerwinner', 'blue'].includes(s)) return J;
-  if (['banker', 'banca', 'bankerwin', 'bankerwins', 'bankerwon', 'bankerwinner', 'red', 'vermelho'].includes(s)) return B;
+  if (['player', 'jogador', 'playerwin', 'playerwins', 'playerwon', 'blue'].includes(s)) return J;
+  if (['banker', 'banca', 'bankerwin', 'bankerwins', 'bankerwon', 'red', 'vermelho'].includes(s)) return B;
   if (['tie', 'draw', 'empate', 'equal', 'push', 'tied'].includes(s)) return E;
   return null;
 }
@@ -170,59 +162,49 @@ function validMs(v) {
 function extractItems(body) {
   if (Array.isArray(body)) return body;
   if (!body || typeof body !== 'object') return [];
-  const c = [
+  const candidates = [
     body.data, body.results, body.items, body.resultados, body.rounds, body.events,
     body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds,
     body.data?.events, body.data?.data
   ];
-  return c.find(Array.isArray) || [];
+  return candidates.find(Array.isArray) || [];
 }
 
 function normalizeRound(item) {
   const d = item?.data || item?.round || item || {};
-  const r = d.result && typeof d.result === 'object'
-    ? d.result
-    : item?.result && typeof item.result === 'object' ? item.result : {};
+  const r = (d.result && typeof d.result === 'object') ? d.result :
+            (item?.result && typeof item.result === 'object') ? item.result : {};
 
-  const status = String(d.status ?? d.estado ?? item?.status ?? item?.estado ?? '').toLowerCase();
   const t = validMs(d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ?? d.fim ?? item?.settledAt ?? item?.fim);
-
-  const raw =
-    r.outcome ?? r.resultado ?? r.winner ??
-    d.outcome ?? d.resultado ?? d.winner ??
-    item?.outcome ?? item?.resultado ?? item?.winner ??
-    (typeof d.result === 'string' ? d.result : null) ??
-    (typeof item?.result === 'string' ? item.result : null);
+  const raw = r.outcome ?? r.resultado ?? r.winner ?? d.outcome ?? d.resultado ?? d.winner ??
+              item?.outcome ?? item?.resultado ?? item?.winner ??
+              (typeof d.result === 'string' ? d.result : null) ??
+              (typeof item?.result === 'string' ? item.result : null);
 
   const resultado = normalizeOutcome(raw);
-  const resolvida =
-    ['resolved', 'settled', 'finished', 'complete', 'completed', 'resolvido', 'concluido', 'finalizado']
-      .some((w) => status.includes(w)) || Boolean(t);
+  const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? '').trim();
 
-  const id = String(
-    d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
-  ).trim();
-  if (!id || !resultado || !resolvida || !t) return null;
+  if (!id || !resultado || !t) return null;
 
   const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
   const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
-  const mult = r.multiplier ?? d.multiplier ?? d.multiplicador ?? null;
 
   return {
-    id, resultado, t,
+    id,
+    resultado,
+    t,
     pj: Number.isFinite(pj) ? pj : null,
-    pb: Number.isFinite(pb) ? pb : null,
-    mult: mult == null ? null : String(mult)
+    pb: Number.isFinite(pb) ? pb : null
   };
 }
 
 async function fetchRounds() {
-  let last = null;
+  let lastErr = null;
   for (let i = 1; i <= 3; i++) {
     try {
       const resp = await axios.get(API_BACBO, {
-        timeout: 15000,
-        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDadosBot/11.1' }
+        timeout: 14000,
+        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/12.0' }
       });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
@@ -232,25 +214,18 @@ async function fetchRounds() {
       R.erroAPI = null;
       return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     } catch (e) {
-      last = e;
+      lastErr = e;
       R.erroAPI = e.message;
-      if (i < 3) await sleep(600 * i);
+      if (i < 3) await sleep(500 * i);
     }
   }
-  throw last || new Error('Falha na API');
+  throw lastErr || new Error('Falha API');
 }
 
-/* ============================ ESTRATÉGIAS (mantidas) ============================ */
-
-function streak(seq) {
-  if (!seq.length) return 0;
-  let n = 0;
-  for (const r of seq) { if (r.resultado === seq[0].resultado) n++; else break; }
-  return n;
-}
+/* ============================ HELPERS NUMÉRICOS ============================ */
 
 const hasScore = (r) => r && Number.isFinite(r.pj) && Number.isFinite(r.pb);
-const margem = (r) => Math.abs(r.pj - r.pb);
+const margem = (r) => Math.abs((r.pj || 0) - (r.pb || 0));
 const scoreOf = (r) => (r.resultado === J ? r.pj : r.pb);
 const scoreRange = (s) => {
   if (!Number.isFinite(s)) return null;
@@ -261,212 +236,168 @@ const scoreRange = (s) => {
   return 'MA';
 };
 
+function streak(seq) {
+  if (!seq.length) return 0;
+  let n = 0;
+  const cor = seq[0].resultado;
+  for (const r of seq) {
+    if (r.resultado === cor) n++;
+    else break;
+  }
+  return n;
+}
+
+/* ============================ ESTRATÉGIAS (FOCO SEQUENCIAL + NUMÉRICO) ============================ */
+
 const STRATS = [
-  function repeticao({ seq }) {
+  // ========== SEQUÊNCIAS FORTES ==========
+  function seqRepeticao({ seq }) {
     const n = streak(seq);
-    if (n < 2 || n > 8) return null;
-    const strength = [0, 0, 58, 68, 75, 80, 82, 82, 82][n] || 82;
-    return { cor: seq[0].resultado, key: `REPETICAO_\( {Math.min(n, 6)}`, nome: `Repetição x \){n}`, emoji: '🔁', strength };
+    if (n < 3 || n > 7) return null;
+    const strength = [0, 0, 0, 72, 78, 84, 86, 86][n] || 86;
+    return { cor: seq[0].resultado, key: `SEQ_REP_\( {n}`, nome: `Sequência x \){n}`, emoji: '🔁', strength, tipo: 'seq' };
   },
-  function quebra({ seq }) {
+  function seqQuebra({ seq }) {
     const n = streak(seq);
-    if (n < 3 || n > 9) return null;
-    const strength = [0, 0, 0, 65, 72, 78, 80, 80, 80, 80][n] || 80;
-    return { cor: opp(seq[0].resultado), key: `QUEBRA_\( {Math.min(n, 7)}`, nome: `Quebra de sequência x \){n}`, emoji: '💥', strength };
+    if (n < 4 || n > 8) return null;
+    const strength = [0, 0, 0, 0, 74, 80, 84, 85, 85][n] || 85;
+    return { cor: opp(seq[0].resultado), key: `SEQ_QUEBRA_\( {n}`, nome: `Quebra x \){n}`, emoji: '💥', strength, tipo: 'seq' };
   },
-  function surf({ seq }) {
-    if (seq.length < 4) return null;
+  function seqSurf({ seq }) {
+    if (seq.length < 5) return null;
     let L = 1;
     while (L < seq.length && seq[L].resultado !== seq[L - 1].resultado) L++;
-    if (L < 3) return null;
-    const strength = L >= 6 ? 82 : L >= 5 ? 78 : L >= 4 ? 72 : 66;
-    return { cor: opp(seq[0].resultado), key: `SURF_${Math.min(L, 6)}`, nome: `Surf (alternância ${L})`, emoji: '🌊', strength };
+    if (L < 4) return null;
+    const strength = L >= 6 ? 84 : L >= 5 ? 78 : 72;
+    return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, emoji: '🌊', strength, tipo: 'seq' };
   },
-  function doisDois({ seq }) {
+  function seqDoisDois({ seq }) {
     if (seq.length < 4) return null;
-    const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a === b && c === d && a !== c) return { cor: c, key: 'DOIS_DOIS', nome: '2+2 (blocos de dois)', emoji: '♟️', strength: 65 };
-    return null;
-  },
-  function tresUm({ seq }) {
-    if (seq.length < 4) return null;
-    const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a !== b && b === c && c === d) return { cor: a, key: 'TRES_UM', nome: 'Quebra confirmada (3→1)', emoji: '🧩', strength: 70 };
-    return null;
-  },
-  function forca({ seq }) {
-    const s = seq.slice(0, 12);
-    if (s.length < 10) return null;
-    const pj = s.filter((x) => x.resultado === J).length / s.length;
-    const dom = pj >= 0.5 ? J : B;
-    const pct = Math.max(pj, 1 - pj);
-    if (pct < 0.67) return null;
-    const bucket = pct >= 0.75 ? 75 : pct >= 0.7 ? 70 : 67;
-    const strength = pct >= 0.75 ? 82 : pct >= 0.7 ? 74 : 68;
-    return { cor: dom, key: `FORCA_${bucket}`, nome: `Força da mesa ${Math.round(pct * 100)}%`, emoji: '💪', strength };
-  },
-  function reversao({ seq }) {
-    const s = seq.slice(0, 20);
-    if (s.length < 16) return null;
-    const pj = s.filter((x) => x.resultado === J).length / s.length;
-    const pct = Math.max(pj, 1 - pj);
-    if (pct < 0.65) return null;
-    const dom = pj >= 0.5 ? J : B;
-    return { cor: opp(dom), key: 'REVERSAO_20', nome: `Retorno à média (${Math.round(pct * 100)}% ${dom})`, emoji: '⚖️', strength: 65 };
-  },
-  function contexto({ seq }) {
-    const out = [];
-    for (const k of [3, 4, 5]) {
-      if (seq.length < k) continue;
-      const p = seq.slice(0, k).map((x) => (x.resultado === J ? 'J' : 'B')).join('');
-      const vis = p.split('').reverse().join('');
-      const last = seq[0].resultado;
-      const st = k === 3 ? 62 : k === 4 ? 68 : 72;
-      out.push({ cor: last, key: `CTX\( {k}_ \){p}_SEG`, nome: `Sequência ${vis} → segue`, emoji: '🧬', strength: st });
-      out.push({ cor: opp(last), key: `CTX\( {k}_ \){p}_CON`, nome: `Sequência ${vis} → contraria`, emoji: '🧬', strength: st });
+    const [a, b, c, d] = seq.map(x => x.resultado);
+    if (a === b && c === d && a !== c) {
+      return { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', emoji: '♟️', strength: 76, tipo: 'seq' };
     }
-    return out;
+    return null;
   },
+  function seqTresUm({ seq }) {
+    if (seq.length < 4) return null;
+    const [a, b, c, d] = seq.map(x => x.resultado);
+    if (a !== b && b === c && c === d) {
+      return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', emoji: '🧩', strength: 78, tipo: 'seq' };
+    }
+    return null;
+  },
+
+  // ========== NUMÉRICOS (PRIORIDADE ALTA) ==========
   function numEscada({ seq }) {
     if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
-    const [a, b, c] = seq.slice(0, 3);
+    const [a, b, c] = seq;
     if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
     const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
     if ((sb - sa === 1 && sc - sb === 1) || (sa - sb === 1 && sb - sc === 1)) {
-      return { cor: a.resultado, key: 'NUM_ESCADA_3', nome: `Escada \( {sa}→ \){sb}→${sc}`, emoji: '🪜', strength: 80 };
+      return { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada \( {sa}→ \){sb}→${sc}`, emoji: '🪜', strength: 88, tipo: 'num' };
     }
     return null;
-  },
-  function numRange({ seq }) {
-    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
-    const [a, b] = seq;
-    const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b));
-    if (!ra || !rb || ra === rb) return null;
-    if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) {
-      return { cor: opp(a.resultado), key: `NUM_RANGE_\( {ra}_ \){rb}`, nome: `Salto de range \( {scoreOf(b)}→ \){scoreOf(a)}`, emoji: '📐', strength: 72 };
-    }
-    return null;
-  },
-  function numEspelho({ rows }) {
-    const r = rows[0];
-    if (!r || !hasScore(r) || r.pj !== r.pb) return null;
-    return { cor: r.resultado, key: 'NUM_ESPELHO', nome: `Espelho \( {r.pj}× \){r.pb}`, emoji: '🪞', strength: 78 };
   },
   function numRepeteScore({ seq }) {
     if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
     const [a, b] = seq;
     if (a.resultado !== b.resultado) return null;
     if (scoreOf(a) === scoreOf(b)) {
-      return { cor: a.resultado, key: 'NUM_REPETE_SCORE', nome: `Score repetido \( {scoreOf(b)}→ \){scoreOf(a)}`, emoji: '🔂', strength: 76 };
+      return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, emoji: '🔂', strength: 84, tipo: 'num' };
     }
     return null;
   },
   function numGatilho({ seq }) {
     if (!seq.length || !hasScore(seq[0])) return null;
-    const r = seq[0], s = scoreOf(r);
-    if (s === 0 || s === 1 || s === 8 || s === 9) {
-      const strength = (s === 0 || s === 9) ? 76 : 66;
-      return { cor: opp(r.resultado), key: `NUM_GATILHO_${s}`, nome: `Gatilho ${s}`, emoji: '🎯', strength };
+    const r = seq[0];
+    const s = scoreOf(r);
+    if (s === 0 || s === 1 || s === 9) {
+      return { cor: opp(r.resultado), key: `NUM_GATILHO_${s}`, nome: `Gatilho extremo ${s}`, emoji: '🎯', strength: 86, tipo: 'num' };
+    }
+    if (s === 8) {
+      return { cor: opp(r.resultado), key: 'NUM_GATILHO_8', nome: 'Gatilho 8', emoji: '🎯', strength: 78, tipo: 'num' };
     }
     return null;
   },
-  function numMargemTrend({ seq }) {
-    if (seq.length < 3) return null;
-    const t = seq.slice(0, 3);
-    if (!t.every(hasScore)) return null;
-    const [m2, m1, m0] = [margem(t[2]), margem(t[1]), margem(t[0])];
-    if ((m2 < m1 && m1 < m0) || (m0 < m1 && m1 < m2)) {
-      return {
-        cor: t[0].resultado,
-        key: 'NUM_MARGEM_TREND',
-        nome: `Margem em \( {m0 > m1 ? 'alta' : 'queda'} ( \){m2}→\( {m1}→ \){m0})`,
-        emoji: '📊', strength: 70
-      };
-    }
-    return null;
-  },
-  function numParidade({ seq }) {
-    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
-    const t = seq.slice(0, 3).map(scoreOf);
-    const p = t.map((s) => s % 2);
-    if (p[0] === p[1] && p[1] === p[2]) {
-      return { cor: seq[0].resultado, key: `NUM_PARIDADE_${p[0] ? 'I' : 'P'}`, nome: `Paridade ${p[0] ? 'ímpar' : 'par'} x3`, emoji: '🔢', strength: 68 };
-    }
-    return null;
-  },
-  function numSeq({ seq }) {
-    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
-    const t = seq.slice(0, 3).map(scoreOf);
-    if (t[0] < t[1] && t[1] < t[2]) {
-      return { cor: seq[0].resultado, key: 'NUM_SEQ_CRESC', nome: `Scores crescentes \( {t[2]}→ \){t[1]}→${t[0]}`, emoji: '📈', strength: 72 };
-    }
-    if (t[0] > t[1] && t[1] > t[2]) {
-      return { cor: seq[0].resultado, key: 'NUM_SEQ_DECR', nome: `Scores decrescentes \( {t[2]}→ \){t[1]}→${t[0]}`, emoji: '📉', strength: 72 };
-    }
-    return null;
-  },
-  function numAlta({ rows }) {
+  function numMargemAlta({ rows }) {
     const r = rows[0];
-    if (!r || !isCol(r.resultado) || !hasScore(r)) return null;
-    const v = scoreOf(r);
-    if (v < 10 || margem(r) < 1) return null;
-    return { cor: r.resultado, key: 'NUM_ALTA_10', nome: `Numérica Alta (${v})`, emoji: '🔢', strength: 74 };
+    if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
+    return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta \( {r.pj}× \){r.pb}`, emoji: '📊', strength: 82, tipo: 'num' };
   },
-  function numDiff4({ seq }) {
+  function numDiff4x3({ seq }) {
     if (seq.length < 3) return null;
     const t = seq.slice(0, 3);
-    if (!t.every((r) => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
-    return { cor: t[0].resultado, key: 'NUM_DIFF4_X3', nome: 'Diff≥4 x3 mesma cor', emoji: '🔢', strength: 78 };
+    if (!t.every(r => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
+    return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 x3', emoji: '🔢', strength: 85, tipo: 'num' };
   },
   function numViradaBaixa({ seq }) {
     if (seq.length < 2) return null;
     const [a, b] = seq;
     if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null;
-    if (scoreOf(a) > 5 || scoreOf(b) > 5) return null;
-    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada Baixa (baixos repetidos)', emoji: '🔢', strength: 70 };
+    if (scoreOf(a) > 4 || scoreOf(b) > 4) return null;
+    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', emoji: '🔄', strength: 80, tipo: 'num' };
   },
-  function numMargem({ rows }) {
+  function numEspelho({ rows }) {
     const r = rows[0];
-    if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
-    return { cor: r.resultado, key: 'NUM_MARGEM_5', nome: `Margem \( {r.pj}× \){r.pb}`, emoji: '🔢', strength: 72 };
+    if (!r || !hasScore(r) || r.pj !== r.pb) return null;
+    return { cor: r.resultado, key: 'NUM_ESPELHO', nome: `Espelho \( {r.pj}× \){r.pb}`, emoji: '🪞', strength: 83, tipo: 'num' };
   },
   function numTendencia({ rows }) {
-    const s = rows.slice(0, 6).filter(hasScore);
+    const s = rows.slice(0, 8).filter(hasScore);
     if (s.length < 6) return null;
     const mj = s.reduce((a, r) => a + r.pj, 0) / s.length;
     const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
     const diff = mj - mb;
-    if (Math.abs(diff) < 1.3) return null;
+    if (Math.abs(diff) < 1.5) return null;
     return {
       cor: diff > 0 ? J : B,
-      key: `NUM_TEND_${Math.abs(diff) >= 2 ? 2 : 1}`,
-      nome: `Média pontos \( {mj.toFixed(1)}× \){mb.toFixed(1)}`,
-      emoji: '📊', strength: Math.abs(diff) >= 2 ? 76 : 68
+      key: 'NUM_TENDENCIA',
+      nome: `Tendência \( {mj.toFixed(1)}× \){mb.toFixed(1)}`,
+      emoji: '📈',
+      strength: Math.abs(diff) >= 2.2 ? 84 : 76,
+      tipo: 'num'
     };
+  },
+  function numRangeSalto({ seq }) {
+    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
+    const [a, b] = seq;
+    const ra = scoreRange(scoreOf(a));
+    const rb = scoreRange(scoreOf(b));
+    if (!ra || !rb) return null;
+    if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) {
+      return { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto \( {scoreOf(b)}→ \){scoreOf(a)}`, emoji: '📐', strength: 81, tipo: 'num' };
+    }
+    return null;
   },
   function numPosEmpate({ rows, seq }) {
     if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
-    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate (cor anterior)', emoji: '🎯', strength: 62 };
+    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' };
   }
 ];
 
 function runStrategies(rows) {
-  const ctx = { rows, seq: rows.filter((r) => isCol(r.resultado)) };
+  const seq = rows.filter(r => isCol(r.resultado));
+  const ctx = { rows, seq };
   const out = [];
   for (const fn of STRATS) {
     try {
       const r = fn(ctx);
-      for (const c of Array.isArray(r) ? r : [r]) if (c && isCol(c.cor)) out.push(c);
+      if (Array.isArray(r)) {
+        for (const c of r) if (c && isCol(c.cor)) out.push(c);
+      } else if (r && isCol(r.cor)) {
+        out.push(r);
+      }
     } catch (_) {}
   }
   return out;
 }
 
-/* ============================ BACKTEST ============================ */
+/* ============================ BACKTEST SIMPLES ============================ */
 
 function windowAt(H, i) {
   const rows = [];
-  for (let j = i; j >= 0 && rows.length < 24; j--) {
+  for (let j = i; j >= 0 && rows.length < 20; j--) {
     if (rows.length && rows[rows.length - 1].t - H[j].t > CFG.gapMs) break;
     rows.push(H[j]);
   }
@@ -487,75 +418,72 @@ function evalEntry(H, i, cor) {
 function backtest() {
   const H = S.hist;
   const per = {};
-  const ini = 8;
+  const ini = 10;
   const fim = H.length - 1;
-  const corte = ini + Math.floor((fim - ini) * 0.7);
-  let bw = 0, bn = 0, tw = 0, tn = 0;
+  if (fim - ini < 30) return { per, baseRate: 0.52 };
+
+  let bw = 0, bn = 0;
   for (let i = ini; i < fim; i++) {
     const win = windowAt(H, i);
     if (win.length < 6) continue;
-    const teste = i >= corte;
-    for (const cor of [J, B]) {
-      const v = evalEntry(H, i, cor);
-      if (v === null) continue;
-      bn++; if (v) bw++;
-      if (teste) { tn++; if (v) tw++; }
-    }
     for (const c of runStrategies(win)) {
       const v = evalEntry(H, i, c.cor);
       if (v === null) continue;
-      const p = per[c.key] || (per[c.key] = { n: 0, w: 0, nt: 0, wt: 0 });
-      p.n++; if (v) p.w++;
-      if (teste) { p.nt++; if (v) p.wt++; }
+      const p = per[c.key] || (per[c.key] = { n: 0, w: 0 });
+      p.n++;
+      if (v) p.w++;
+      bn++;
+      if (v) bw++;
     }
   }
-  return { per, baseW: bw, baseN: bn, baseRate: bn ? bw / bn : null, testeRate: tn ? tw / tn : null };
+  return { per, baseRate: bn ? bw / bn : 0.52 };
 }
 
 function getStats(force = false) {
-  if (force || !S.stats || S.hist.length - S.statsAtLen >= 25) {
+  if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
     S.stats = backtest();
     S.statsAtLen = S.hist.length;
   }
   return S.stats;
 }
 
-function wilsonLB(w, n, z = 1.96) {
-  if (!n) return 0;
+function wilsonLB(w, n, z = 1.64) {
+  if (!n || n < 5) return 0.5;
   const p = w / n;
   const z2 = z * z;
   const c = p + z2 / (2 * n);
   const m = z * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n));
-  return (c - m) / (1 + z2 / n);
+  return Math.max(0.35, (c - m) / (1 + z2 / n));
 }
 
-function suspensoAoVivo(key) {
-  const L = S.signals.filter((x) => x.key === key && FECHADOS.includes(x.status)).slice(-6);
-  if (L.length < 4) return false;
-  const losses = L.filter((x) => x.status === 'LOSS').length;
+function suspenso(key) {
+  const recent = S.signals.filter(x => x.key === key && FECHADOS.has(x.status)).slice(-5);
+  if (recent.length < 4) return false;
+  const losses = recent.filter(x => x.status === 'LOSS').length;
   return losses >= 3;
 }
 
-/* ============================ CONFIANÇA COMPOSTA ============================ */
+/* ============================ CONFIANÇA ============================ */
 
-function confiancaComposta(cand, stats) {
-  const p = stats.per[cand.key] || { n: 0, w: 0, nt: 0, wt: 0 };
-  const bt = p.n >= 8 ? wilsonLB(p.w, p.n) : (stats.baseRate || 0.5);
-  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.includes(x.status));
-  const lw = live.filter((x) => x.status === 'GREEN' || x.status === 'G1' || x.status === 'EMPATE').length;
-  const ln = live.length;
-  const liveRate = ln >= 3 ? lw / ln : bt;
+function confianca(cand, stats) {
+  const p = stats.per[cand.key] || { n: 0, w: 0 };
+  const bt = p.n >= 6 ? wilsonLB(p.w, p.n) : (stats.baseRate || 0.52);
+
+  const live = S.signals.filter(x => x.key === cand.key && FECHADOS.has(x.status));
+  const liveW = live.filter(x => x.status !== 'LOSS').length;
+  const liveRate = live.length >= 3 ? liveW / live.length : bt;
 
   let score = 0;
-  score += bt * 38;
-  score += liveRate * 22;
-  score += (cand.strength / 100) * 18;
-  score += Math.min(1, (p.n || 0) / 40) * 12; // atividade
-  // consenso simples
-  const mesmos = runStrategies(S.hist.slice(-20).reverse()).filter((c) => c.cor === cand.cor);
-  score += Math.min(1, mesmos.length / 5) * 10;
+  // Prioridade numérica e sequencial
+  const pesoTipo = cand.tipo === 'num' ? 1.18 : cand.tipo === 'seq' ? 1.12 : 1.0;
 
-  return Math.max(55, Math.min(94, Math.round(score)));
+  score += bt * 36;
+  score += liveRate * 24;
+  score += (cand.strength / 100) * 22;
+  score += Math.min(1, (p.n || 0) / 25) * 10;
+  score *= pesoTipo;
+
+  return Math.max(62, Math.min(93, Math.round(score)));
 }
 
 /* ============================ TELEGRAM ============================ */
@@ -572,7 +500,7 @@ async function tg(texto) {
         text: texto,
         parse_mode: 'HTML',
         disable_web_page_preview: true
-      }, { timeout: 12000 });
+      }, { timeout: 11000 });
       if (r.data?.ok) {
         R.erroTelegram = null;
         return true;
@@ -581,32 +509,29 @@ async function tg(texto) {
     } catch (e) {
       R.erroTelegram = e.response?.data ? JSON.stringify(e.response.data) : e.message;
       const retry = Number(e.response?.data?.parameters?.retry_after);
-      if (retry > 0 && retry <= 25) await sleep(retry * 1000 + 300);
+      if (retry > 0 && retry <= 20) await sleep(retry * 1000 + 200);
     }
-    if (t < 3) await sleep(1200 * t);
+    if (t < 3) await sleep(1100 * t);
   }
   return false;
 }
 
-/* ============================ APURAÇÃO (CORRIGIDA) ============================ */
+/* ============================ APURAÇÃO (SEM NÃO APURADO) ============================ */
 
 function apurar() {
   const now = Date.now();
-  let mudou = false;
 
   for (const s of S.signals) {
-    if (FECHADOS.includes(s.status)) continue;
+    if (FECHADOS.has(s.status)) continue;
 
-    const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
+    const after = S.hist.filter(r => r.t > s.t).sort((a, b) => a.t - b.t);
 
-    // Timeout → força LOSS (nunca mais NÃO APURADO)
+    // Timeout → LOSS obrigatório
     if (after.length === 0) {
       if (now - s.t >= CFG.apuraMaxMs) {
         s.status = 'LOSS';
         s.fechadoEm = now;
-        s.motivo = 'timeout sem rodadas após o sinal';
-        mudou = true;
-        tg(`❌ <b>SINAL #\( {s.id} → LOSS</b>\n⏱ Timeout de apuração\n \){hora()}`).catch(() => {});
+        tg(`❌ <b>SINAL #${s.id} → LOSS</b>\nMotivo: timeout de apuração\n⏱ ${hora()}`).catch(() => {});
       }
       continue;
     }
@@ -638,55 +563,46 @@ function apurar() {
       s.status = empate ? 'EMPATE' : (gale === 0 ? 'GREEN' : 'G1');
       s.fechadoEm = now;
       s.gale = gale;
-      mudou = true;
       const emoji = s.status === 'GREEN' ? '✅' : s.status === 'G1' ? '✅✅' : '🟡';
       tg(`\( {emoji} <b>SINAL # \){s.id} → \( {s.status}</b>\n \){corTxt(s.cor)}\n⏱ ${hora()}`).catch(() => {});
-    } else if (after.length > MAX_GALE) {
+    } else if (after.length > MAX_GALE || now - s.t >= CFG.apuraMaxMs) {
       s.status = 'LOSS';
       s.fechadoEm = now;
-      mudou = true;
       tg(`❌ <b>SINAL #\( {s.id} → LOSS</b>\n \){corTxt(s.cor)}\n⏱ ${hora()}`).catch(() => {});
-    } else if (now - s.t >= CFG.apuraMaxMs) {
-      s.status = 'LOSS';
-      s.fechadoEm = now;
-      s.motivo = 'timeout';
-      mudou = true;
-      tg(`❌ <b>SINAL #${s.id} → LOSS</b> (timeout)\n⏱ ${hora()}`).catch(() => {});
     }
   }
-
-  if (mudou) R.ultimoSinal = S.signals[S.signals.length - 1] || null;
 }
 
-/* ============================ GERAÇÃO DE SINAL (CORRIGIDA) ============================ */
+/* ============================ GERAÇÃO DE SINAL ============================ */
 
 function podeGerar() {
   if (!CFG.ativos) {
     R.ultimoMotivo = 'sinais desativados';
     return false;
   }
-  if (S.signals.some((s) => !FECHADOS.includes(s.status))) {
-    R.ultimoMotivo = 'já existe sinal pendente';
+  if (S.signals.some(s => !FECHADOS.has(s.status))) {
+    R.ultimoMotivo = 'existe sinal pendente';
     return false;
   }
+
   const now = Date.now();
-  const desdeUltimo = now - (S.lastSignalAt || 0);
-  if (desdeUltimo < CFG.minIntervalMs) {
-    R.ultimoMotivo = `intervalo mínimo (${Math.round((CFG.minIntervalMs - desdeUltimo) / 1000)}s restantes)`;
+  const desde = now - (S.lastSignalAt || 0);
+  if (desde < CFG.minIntervalMs) {
+    R.ultimoMotivo = `aguardar intervalo (${Math.round((CFG.minIntervalMs - desde) / 1000)}s)`;
     return false;
   }
-  // Se passou do máximo, força (mas ainda respeita o atraso da rodada)
+
   const last = S.hist[S.hist.length - 1];
   if (!last) {
     R.ultimoMotivo = 'sem histórico';
     return false;
   }
   if (now - last.t < CFG.atrasoRodadaMs) {
-    R.ultimoMotivo = `aguardar ${Math.round((CFG.atrasoRodadaMs - (now - last.t)) / 1000)}s após última rodada`;
+    R.ultimoMotivo = `aguardar ${Math.round((CFG.atrasoRodadaMs - (now - last.t)) / 1000)}s após rodada`;
     return false;
   }
   if (S.hist.length < CFG.minAmostra) {
-    R.ultimoMotivo = `amostra insuficiente (\( {S.hist.length}/ \){CFG.minAmostra})`;
+    R.ultimoMotivo = `amostra baixa (${S.hist.length})`;
     return false;
   }
   return true;
@@ -695,10 +611,10 @@ function podeGerar() {
 function tentarSinal() {
   if (!podeGerar()) return;
 
-  const rows = S.hist.slice(-30).reverse();
+  const rows = S.hist.slice(-25).reverse();
   const cands = runStrategies(rows);
   if (!cands.length) {
-    R.ultimoMotivo = 'nenhuma estratégia disparou';
+    R.ultimoMotivo = 'nenhuma estratégia ativada';
     return;
   }
 
@@ -706,10 +622,17 @@ function tentarSinal() {
   let melhor = null;
   let melhorScore = 0;
 
-  for (const c of cands) {
-    if (suspensoAoVivo(c.key)) continue;
-    const conf = confiancaComposta(c, stats);
-    if (conf < 72) continue;
+  // Prioriza numéricos e sequenciais
+  const ordenados = cands.sort((a, b) => {
+    const pa = a.tipo === 'num' ? 3 : a.tipo === 'seq' ? 2 : 1;
+    const pb = b.tipo === 'num' ? 3 : b.tipo === 'seq' ? 2 : 1;
+    return pb - pa;
+  });
+
+  for (const c of ordenados) {
+    if (suspenso(c.key)) continue;
+    const conf = confianca(c, stats);
+    if (conf < 74) continue;
     if (conf > melhorScore) {
       melhorScore = conf;
       melhor = { ...c, conf };
@@ -730,14 +653,14 @@ function tentarSinal() {
     nome: melhor.nome,
     emoji: melhor.emoji,
     conf: melhor.conf,
+    tipo: melhor.tipo,
     status: 'PENDENTE',
     t: now,
-    criadoEm: now,
-    gale: 0
+    criadoEm: now
   };
 
   S.signals.push(sinal);
-  if (S.signals.length > 300) S.signals = S.signals.slice(-250);
+  if (S.signals.length > 200) S.signals = S.signals.slice(-150);
   S.lastSignalAt = now;
   R.ultimoSinal = sinal;
   R.ultimoMotivo = null;
@@ -748,6 +671,7 @@ function tentarSinal() {
     ``,
     `Entrada: ${corTxt(melhor.cor)}`,
     `Confiança: <b>${melhor.conf}%</b> ${barra(melhor.conf)}`,
+    `Tipo: ${melhor.tipo === 'num' ? 'Numérico' : 'Sequencial'}`,
     `Gale máximo: 1`,
     CFG.empateGreen ? `Empate = GREEN` : `Empate = LOSS`,
     ``,
@@ -755,7 +679,7 @@ function tentarSinal() {
   ].join('\n');
 
   tg(msg).catch(() => {});
-  log('SINAL', { id, cor: melhor.cor, conf: melhor.conf, key: melhor.key });
+  log('SINAL', { id, cor: melhor.cor, conf: melhor.conf, key: melhor.key, tipo: melhor.tipo });
 }
 
 /* ============================ SYNC ============================ */
@@ -772,9 +696,9 @@ async function sync() {
       R.ultimaRodadaNova = new Date(r.t).toISOString();
     }
     if (S.hist.length > CFG.maxHist) {
-      const cut = S.hist.length - CFG.maxHist;
-      for (let i = 0; i < cut; i++) S.seen.delete(S.hist[i].id);
-      S.hist = S.hist.slice(cut);
+      const excesso = S.hist.length - CFG.maxHist;
+      for (let i = 0; i < excesso; i++) S.seen.delete(S.hist[i].id);
+      S.hist = S.hist.slice(excesso);
     }
     S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     R.ultimaSync = new Date().toISOString();
@@ -786,7 +710,7 @@ async function sync() {
   }
 }
 
-/* ============================ LOOP PRINCIPAL ============================ */
+/* ============================ LOOP ============================ */
 
 async function tick() {
   if (busy || stopping) return;
@@ -794,8 +718,8 @@ async function tick() {
   lastTickMs = Date.now();
   try {
     await sync();
-    apurar();          // primeiro fecha o que der
-    tentarSinal();     // só depois tenta gerar (respeitando atraso)
+    apurar();       // fecha primeiro
+    tentarSinal();  // só depois tenta gerar
   } catch (e) {
     log('TICK ERRO', e.message);
   } finally {
@@ -803,24 +727,24 @@ async function tick() {
   }
 }
 
-/* ============================ KEEP-ALIVE + WAKE ============================ */
+/* ============================ KEEP-ALIVE ============================ */
 
 async function keepAlive() {
   R.ultimoKeepAlive = new Date().toISOString();
   const self = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
   if (self) {
     try {
-      await axios.get(self.replace(/\/$/, '') + '/health', { timeout: 8000 });
+      await axios.get(self.replace(/\/$/, '') + '/health', { timeout: 7000 });
     } catch (_) {}
   }
 }
 
 function wakeCheck() {
-  const now = Date.now();
-  if (now - lastTickMs > CFG.syncMs * 4) {
+  const agora = Date.now();
+  if (agora - lastTickMs > CFG.syncMs * 5) {
     R.wakes++;
     R.ultimoWake = new Date().toISOString();
-    log('WAKE', `detectado atraso de ${Math.round((now - lastTickMs) / 1000)}s`);
+    log('WAKE', `atraso ${Math.round((agora - lastTickMs) / 1000)}s`);
     tick().catch(() => {});
   }
 }
@@ -830,39 +754,43 @@ function wakeCheck() {
 const app = express();
 app.disable('x-powered-by');
 app.use(cors());
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '200kb' }));
 
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    versao: '11.1',
+    versao: '12.0',
     deployId: DEPLOY_ID,
     hist: S.hist.length,
     sinais: S.signals.length,
-    ultimoSinal: R.ultimoSinal ? { id: R.ultimoSinal.id, status: R.ultimoSinal.status } : null,
+    ultimoSinal: R.ultimoSinal ? { id: R.ultimoSinal.id, status: R.ultimoSinal.status, conf: R.ultimoSinal.conf } : null,
     ultimaSync: R.ultimaSync,
     erroAPI: R.erroAPI,
-    uptime: process.uptime()
+    uptime: Math.round(process.uptime())
   });
 });
 
 app.get('/status', (req, res) => {
   if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
-  res.json({ S: { histLen: S.hist.length, nextId: S.nextId, lastSignalAt: S.lastSignalAt }, R });
-});
-
-app.post('/admin/reset-hist', (req, res) => {
-  if (ADMIN_TOKEN && req.headers['x-admin-token'] !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
-  S.hist = [];
-  S.seen.clear();
-  S.stats = null;
-  res.json({ ok: true });
+  res.json({
+    hist: S.hist.length,
+    nextId: S.nextId,
+    lastSignalAt: S.lastSignalAt,
+    motivo: R.ultimoMotivo,
+    R
+  });
 });
 
 /* ============================ START ============================ */
 
 async function start() {
-  log('BOOT', { versao: '11.1', deployId: DEPLOY_ID, minInterval: CFG.minIntervalMs, atrasoRodada: CFG.atrasoRodadaMs });
+  log('BOOT', {
+    versao: '12.0',
+    deployId: DEPLOY_ID,
+    minInterval: CFG.minIntervalMs,
+    atrasoRodada: CFG.atrasoRodadaMs,
+    apuraMax: CFG.apuraMaxMs
+  });
 
   if (DATABASE_URL) {
     try {
@@ -872,15 +800,13 @@ async function start() {
         max: 3
       });
       await pool.query('SELECT 1');
-      log('DB', 'conectado');
+      log('DB', 'ok');
     } catch (e) {
-      R.erroDB = e.message;
       log('DB ERRO', e.message);
       pool = null;
     }
   }
 
-  // carga inicial
   await sync();
   getStats(true);
 
@@ -892,8 +818,7 @@ async function start() {
     wakeCheck();
   }, CFG.keepAliveMs);
 
-  // primeiro tick imediato
-  setTimeout(() => tick().catch(() => {}), 1500);
+  setTimeout(() => tick().catch(() => {}), 2000);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
@@ -902,7 +827,7 @@ async function start() {
 async function shutdown() {
   if (stopping) return;
   stopping = true;
-  log('SHUTDOWN', 'iniciado');
+  log('SHUTDOWN', 'ok');
   clearInterval(tickTimer);
   clearInterval(keepTimer);
   if (server) server.close();
@@ -910,7 +835,7 @@ async function shutdown() {
   process.exit(0);
 }
 
-start().catch((e) => {
+start().catch(e => {
   console.error(e);
   process.exit(1);
 });
