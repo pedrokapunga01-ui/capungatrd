@@ -40,7 +40,8 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
 // 🚨 TRAVA DE SEGURANÇA: API FIXA NO CASINO.ORG 🚨
-const API_BACBO = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
+const API_BACBO =
+  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
 const MAX_GALE = 1;
 const SLOT_MS = 5 * 60 * 1000;
